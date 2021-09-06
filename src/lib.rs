@@ -2,8 +2,6 @@
 #[macro_use]
 extern crate log;
 
-pub mod peer;
-
 pub use lapin::{
     message::Delivery, options::*, types::*, BasicProperties, Channel, Connection,
     ConnectionProperties, ExchangeKind, Queue,
