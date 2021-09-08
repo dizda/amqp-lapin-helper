@@ -22,6 +22,7 @@ pub mod types {
 use async_trait::async_trait;
 use bincode::ErrorKind;
 use futures_lite::StreamExt;
+use lapin::publisher_confirm::Confirmation;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::task;
@@ -164,6 +165,28 @@ impl Publisher {
             error!("Unable to publish msg: {}", err);
         }
         // no need to use the confirmation because ConfirmNotRequested (we don't need it for now)
+    }
+
+    /// Push without serializing
+    pub async fn publish_raw(
+        &self,
+        exchange: &str,
+        routing_key: &str,
+        msg: Vec<u8>,
+    ) -> Result<Confirmation> {
+        let res = self
+            .channel
+            .basic_publish(
+                exchange,
+                routing_key,
+                BasicPublishOptions::default(),
+                msg,
+                BasicProperties::default(),
+            )
+            .await?;
+
+        let res = res.await?;
+        Ok(res)
     }
 }
 
