@@ -72,13 +72,13 @@ pub trait BrokerListener: Send + Sync {
 }
 
 /// AMQP Client
-pub struct Broker<L> {
+pub struct Broker {
     conn: Option<Connection>,
     publisher: Option<Publisher>,
-    consumer: Option<Consumer<L>>,
+    consumer: Option<Consumer>,
 }
 
-impl<L: 'static + BrokerListener> Broker<L> {
+impl Broker {
     pub fn new() -> Self {
         Self {
             conn: None,
@@ -109,7 +109,7 @@ impl<L: 'static + BrokerListener> Broker<L> {
     }
 
     /// Init the consumer then return a mut instance in case we need to make more bindings
-    pub async fn setup_consumer(&mut self) -> Result<&mut Consumer<L>> {
+    pub async fn setup_consumer(&mut self) -> Result<&mut Consumer> {
         let channel = self.conn.as_ref().unwrap().create_channel().await?;
         let consumer = Consumer::new(channel);
 
@@ -198,13 +198,13 @@ impl Clone for Publisher {
     }
 }
 
-pub struct Consumer<L> {
+pub struct Consumer {
     channel: Channel,
     consumer: Option<lapin::Consumer>,
-    listeners: Vec<Arc<L>>, // Replace Box with Arc, because a Box can not be cloned.
+    listeners: Vec<Arc<dyn BrokerListener>>, // Replace Box with Arc, because a Box can not be cloned.
 }
 
-impl<L: 'static + BrokerListener> Consumer<L> {
+impl Consumer {
     pub fn new(channel: Channel) -> Self {
         Self {
             channel,
@@ -223,7 +223,7 @@ impl<L: 'static + BrokerListener> Consumer<L> {
 
     /// Add and store listeners
     /// When a listener is added, it will bind the queue to the specified exchange name.
-    pub fn add_listener(&mut self, listener: Arc<L>) {
+    pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
         self.listeners.push(listener);
     }
 
@@ -244,7 +244,10 @@ impl<L: 'static + BrokerListener> Consumer<L> {
     }
 
     /// Consume messages by finding the appropriated listener.
-    pub async fn consume(mut consumer: lapin::Consumer, listeners: Vec<Arc<L>>) -> Result<()> {
+    pub async fn consume(
+        mut consumer: lapin::Consumer,
+        listeners: Vec<Arc<dyn BrokerListener>>,
+    ) -> Result<()> {
         debug!("Broker consuming...");
         while let Some(message) = consumer.next().await {
             match message {
@@ -285,7 +288,7 @@ impl<L: 'static + BrokerListener> Consumer<L> {
     }
 }
 
-impl<L: BrokerListener> Clone for Consumer<L> {
+impl Clone for Consumer {
     fn clone(&self) -> Self {
         Self {
             channel: self.channel.clone(),
@@ -296,7 +299,11 @@ impl<L: BrokerListener> Clone for Consumer<L> {
 }
 
 /// Consume the delivery async
-async fn consume_async<L: BrokerListener>(delivery: Delivery, listener: Arc<L>, channel: Channel) {
+async fn consume_async<L: BrokerListener + ?Sized>(
+    delivery: Delivery,
+    listener: Arc<L>,
+    channel: Channel,
+) {
     let delivery_tag = delivery.delivery_tag;
 
     if let Err(err) = listener.consume(delivery).await {
