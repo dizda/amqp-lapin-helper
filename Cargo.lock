@@ -49,6 +49,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "amqp-lapin-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "chrono",
+ "futures-lite",
+ "lapin",
+ "log",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-amqp",
+ "uuid",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -97,26 +117,6 @@ name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
-
-[[package]]
-name = "broker"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "bincode",
- "chrono",
- "futures-lite",
- "lapin",
- "log",
- "once_cell",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-amqp",
- "uuid",
-]
 
 [[package]]
 name = "bytes"

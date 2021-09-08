@@ -1,5 +1,5 @@
 [package]
-name = "broker"
+name = "amqp-lapin-helper"
 description = "rust lapin helper"
 license = "MIT"
 version = "0.1.0"
