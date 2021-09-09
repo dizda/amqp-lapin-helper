@@ -56,11 +56,6 @@ pub trait BrokerPublish {
     fn routing_key(&self) -> &'static str;
 }
 
-pub enum ListenTo {
-    Exchange(&'static str),
-    Queue(&'static str),
-}
-
 /// Plug listeners to the broker.
 #[async_trait]
 pub trait BrokerListener: Send + Sync {
