@@ -307,9 +307,12 @@ async fn consume_async<L: BrokerListener + ?Sized>(
             .basic_nack(delivery_tag, BasicNackOptions::default())
             .await
         {
-            error!("Broker failed to send NACK: {}", err);
+            error!("Broker failed to send NACK: {:?}", err);
         } else {
-            error!("Error during consumption of a delivery: {}, NACK sent", err);
+            error!(
+                "Error during consumption of a delivery: {:?}, NACK sent",
+                err
+            );
         }
     } else {
         // Consumption went fine, we send ACK
