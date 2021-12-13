@@ -53,7 +53,6 @@ pub enum Error {
 #[async_trait]
 pub trait BrokerPublish {
     fn exchange_name(&self) -> &'static str;
-    fn routing_key(&self) -> &'static str;
 }
 
 /// Plug listeners to the broker.
@@ -69,16 +68,16 @@ pub trait BrokerListener: Send + Sync {
 /// AMQP Client
 pub struct Broker {
     conn: Option<Connection>,
-    publisher: Option<Publisher>,
-    consumer: Option<Consumer>,
+    publisher: Publisher,
+    consumer: Consumer,
 }
 
 impl Broker {
     pub fn new() -> Self {
         Self {
             conn: None,
-            publisher: None,
-            consumer: None,
+            publisher: Publisher::new(),
+            consumer: Consumer::new(),
         }
     }
 
@@ -96,46 +95,51 @@ impl Broker {
     /// Setup publisher
     pub async fn setup_publisher(&mut self) -> Result<&Publisher> {
         let channel = self.conn.as_ref().unwrap().create_channel().await?;
-        let publisher = Publisher::new(channel);
+        self.publisher.channel = Some(channel);
 
-        self.publisher = Some(publisher);
-
-        Ok(self.publisher.as_ref().unwrap())
+        Ok(&self.publisher)
     }
 
     /// Init the consumer then return a mut instance in case we need to make more bindings
     pub async fn setup_consumer(&mut self) -> Result<&mut Consumer> {
         let channel = self.conn.as_ref().unwrap().create_channel().await?;
-        let consumer = Consumer::new(channel);
+        self.consumer.channel = Some(channel);
 
-        self.consumer = Some(consumer);
-
-        Ok(self.consumer.as_mut().unwrap())
+        Ok(&mut self.consumer)
     }
 
-    pub async fn publish<P>(&self, entity: &P)
+    pub async fn publish<P>(&self, entity: &P, routing_key: &str)
     where
         P: BrokerPublish + Serialize,
     {
-        self.publisher.as_ref().unwrap().publish(entity).await;
+        self.publisher.publish(entity, routing_key).await;
+    }
+
+    pub async fn publish_raw(
+        &self,
+        exchange: &str,
+        routing_key: &str,
+        msg: Vec<u8>,
+    ) -> Result<Confirmation> {
+        self.publisher.publish_raw(exchange, routing_key, msg).await
     }
 }
 
 pub struct Publisher {
-    channel: Channel,
+    channel: Option<Channel>,
 }
 
 impl Publisher {
-    pub fn new(channel: Channel) -> Self {
-        Self { channel }
+    pub fn new() -> Self {
+        Self { channel: None }
     }
 
     pub fn channel(&self) -> &Channel {
-        &self.channel
+        self.channel.as_ref().expect("Publisher's channel is None")
     }
 
     /// Push item into amqp
-    pub async fn publish<P>(&self, entity: &P)
+    pub async fn publish<P>(&self, entity: &P, routing_key: &str)
     where
         P: BrokerPublish + Serialize,
     {
@@ -145,10 +149,10 @@ impl Publisher {
         };
 
         let res = self
-            .channel
+            .channel()
             .basic_publish(
                 entity.exchange_name(),
-                entity.routing_key(),
+                routing_key,
                 BasicPublishOptions::default(),
                 serialized,
                 BasicProperties::default(),
@@ -170,7 +174,7 @@ impl Publisher {
         msg: Vec<u8>,
     ) -> Result<Confirmation> {
         let res = self
-            .channel
+            .channel()
             .basic_publish(
                 exchange,
                 routing_key,
@@ -194,22 +198,22 @@ impl Clone for Publisher {
 }
 
 pub struct Consumer {
-    channel: Channel,
+    channel: Option<Channel>,
     consumer: Option<lapin::Consumer>,
     listeners: Vec<Arc<dyn BrokerListener>>, // Replace Box with Arc, because a Box can not be cloned.
 }
 
 impl Consumer {
-    pub fn new(channel: Channel) -> Self {
+    pub fn new() -> Self {
         Self {
-            channel,
+            channel: None,
             consumer: None,
             listeners: vec![],
         }
     }
 
     pub fn channel(&self) -> &Channel {
-        &self.channel
+        self.channel.as_ref().expect("Consumer's channel is None")
     }
 
     pub fn set_consumer(&mut self, consumer: lapin::Consumer) {
