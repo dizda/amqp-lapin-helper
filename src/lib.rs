@@ -85,7 +85,7 @@ impl Broker {
     pub async fn init(&mut self, uri: &str) -> Result<()> {
         let conn = Connection::connect(uri, ConnectionProperties::default().with_tokio()).await?;
 
-        info!("Broker connected to {}.", uri);
+        info!("Broker connected.");
 
         self.conn = Some(conn);
 
