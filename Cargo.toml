@@ -2,7 +2,7 @@
 name = "amqp-lapin-helper"
 description = "rust lapin helper"
 license = "MIT"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jonathan Dizdarevic <dizzda@gmail.com>"]
 edition = "2021"
 
@@ -11,11 +11,11 @@ edition = "2021"
 [dependencies]
 lapin = "1.9.0"
 tokio-amqp = "1.0.0"
-serde = { version = "1.0.131", features = ["derive"] }
-serde_json = "1.0.72"
+serde = { version = "1.0.136", features = ["derive"] }
+serde_json = "1.0.79"
 async-trait = "0.1.52"
-tokio = { version = "1.14.0", features = [] }
-once_cell = "1.8.0"
+tokio = { version = "1.17.0", features = [] }
+once_cell = "1.9.0"
 futures-lite = "1.12.0"
 thiserror = "1.0.30"
 log = "0.4.14"
