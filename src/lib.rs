@@ -99,7 +99,7 @@ pub trait BrokerListener: Send + Sync {
 
     /// How to process the Messages queue
     ///  - X: by spawning a task for each of them, up to some concurrent limit X (use semaphore internally)
-    fn concurrent_ack(&self) -> usize {
+    fn max_concurrent_tasks(&self) -> usize {
         1
     }
 
@@ -256,7 +256,7 @@ impl Clone for Listener {
 impl Listener {
     pub fn new(listener: Arc<dyn BrokerListener>) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(listener.concurrent_ack())),
+            semaphore: Arc::new(Semaphore::new(listener.max_concurrent_tasks())),
             inner: listener,
         }
     }
@@ -265,8 +265,8 @@ impl Listener {
         &self.inner
     }
 
-    fn max_concurrent(&self) -> usize {
-        self.inner.concurrent_ack()
+    fn max_concurrent_tasks(&self) -> usize {
+        self.inner.max_concurrent_tasks()
     }
 }
 
@@ -332,13 +332,13 @@ impl Consumer {
                         // Listener found, try to consume the delivery
                         let listener = listener.clone();
                         let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
-                        debug!("waiting for a permit ({}/{} available)", permits_available, listener.max_concurrent());
+                        debug!("waiting for a permit ({}/{} available)", permits_available, listener.max_concurrent_tasks());
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "permits_available"])
                             .set(permits_available);
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "max"])
-                            .set(listener.max_concurrent() as i64);
+                            .set(listener.max_concurrent_tasks() as i64);
 
                         let permit = listener.semaphore.clone();
                         let permit = permit.acquire_owned().await?;
