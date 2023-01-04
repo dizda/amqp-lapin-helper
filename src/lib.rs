@@ -2,6 +2,8 @@
 #[macro_use]
 extern crate log;
 
+use std::ffi::OsStr;
+use std::path::Path;
 pub use lapin::{
     message::Delivery, options::*, types::*, BasicProperties, Channel, Connection,
     ConnectionProperties, ExchangeKind, Queue,
@@ -26,7 +28,7 @@ use lapin::publisher_confirm::Confirmation;
 use serde::Serialize;
 use std::sync::Arc;
 use once_cell::sync::Lazy;
-use prometheus::{IntGaugeVec, opts, register_int_gauge_vec};
+use prometheus::{Histogram, HistogramVec, IntGaugeVec, opts, register_histogram, register_histogram_vec, register_int_gauge_vec};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use tokio::task;
 use tokio::task::JoinHandle;
@@ -34,13 +36,31 @@ use tokio_amqp::*;
 
 pub type Result<E> = std::result::Result<E, Error>;
 
-static STAT_CONCURRENT_CHECK: Lazy<IntGaugeVec> = Lazy::new(|| {
+/// It's not possible to get the binary name at compile time, so we get it here at runtime
+static BINARY_NAME: Lazy<String> = Lazy::new(|| {
+    format!("{}", std::env::current_exe().unwrap().iter().last().expect("can't find the name").to_string_lossy())
+});
+
+static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
         opts!(
-            concat!(env!("CARGO_PKG_NAME"), "_concurrent_check"),
+            format!("{}_{}", *BINARY_NAME, "consumer_concurrent_tasks"), // will generate `consumer_peer_check_consumer_concurrent_tasks`
             "Current/Max concurrent check",
         ),
-        &["kind"],
+        &["exchange_name", "kind"],
+    ).unwrap()
+});
+
+const EXPONENTIAL_SECONDS: &[f64] = &[
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        format!("{}_{}", *BINARY_NAME, "consumer_duration"),
+        "The duration of the consumer",
+        &["exchange_name"],
+        EXPONENTIAL_SECONDS.to_vec(),
     ).unwrap()
 });
 
@@ -313,11 +333,11 @@ impl Consumer {
                         let listener = listener.clone();
                         let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
                         debug!("waiting for a permit ({}/{} available)", permits_available, listener.max_concurrent());
-                        STAT_CONCURRENT_CHECK
-                            .with_label_values(&["permits_available"])
+                        STAT_CONCURRENT_TASK
+                            .with_label_values(&[delivery.exchange.as_str(), "permits_available"])
                             .set(permits_available);
-                        STAT_CONCURRENT_CHECK
-                            .with_label_values(&["max"])
+                        STAT_CONCURRENT_TASK
+                            .with_label_values(&[delivery.exchange.as_str(), "max"])
                             .set(listener.max_concurrent() as i64);
 
                         let permit = listener.semaphore.clone();
@@ -325,7 +345,6 @@ impl Consumer {
                         debug!("Got a permit, we can start to check");
 
                         // consume the delivery asynchronously
-                        // todo: if max_concurrent == 1, don't need to spawn a task
                         task::spawn(consume_async(delivery, listener, channel, permit));
                     } else {
                         // No listener found for that exchange
@@ -376,8 +395,16 @@ async fn consume_async(
 ) {
     let delivery_tag = delivery.delivery_tag;
 
+    // start prometheus duration timer
+    let histogram_timer = STAT_CONSUMER_DURATION.with_label_values(&[listener.inner.exchange_name()]).start_timer();
+
+    // launch the consumer
     let res = listener.listener().consume(delivery).await;
     drop(permit); // release the permit immediately
+
+    // finish and compute the duration to prometheus
+    histogram_timer.observe_duration();
+
 
     // Then send the AMQP `ACK` or `NCK`
     if let Err(err) = res {
