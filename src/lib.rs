@@ -25,14 +25,30 @@ use futures_lite::StreamExt;
 use lapin::publisher_confirm::Confirmation;
 use serde::Serialize;
 use std::sync::Arc;
+use once_cell::sync::Lazy;
+use prometheus::{IntGaugeVec, opts, register_int_gauge_vec};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio_amqp::*;
 
 pub type Result<E> = std::result::Result<E, Error>;
 
+static STAT_CONCURRENT_CHECK: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        opts!(
+            concat!(env!("CARGO_PKG_NAME"), "_concurrent_check"),
+            "Current/Max concurrent check",
+        ),
+        &["kind"],
+    ).unwrap()
+});
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("acquire-semaphore: {0}")]
+    AcquireSemaphore(#[from] AcquireError),
+
     #[error("AMQP: {0}")]
     Amqp(#[from] lapin::Error),
 
@@ -60,6 +76,12 @@ pub trait BrokerPublish {
 pub trait BrokerListener: Send + Sync {
     /// Bind the queue & struct to this exchange name
     fn exchange_name(&self) -> &'static str;
+
+    /// How to process the Messages queue
+    ///  - X: by spawning a task for each of them, up to some concurrent limit X (use semaphore internally)
+    fn concurrent_ack(&self) -> usize {
+        1
+    }
 
     /// The method that will be called in the struct impl on every messages received
     async fn consume(&self, delivery: Delivery) -> Result<()>;
@@ -197,10 +219,41 @@ impl Clone for Publisher {
     }
 }
 
+pub struct Listener {
+    inner: Arc<dyn BrokerListener>,  // Replace Box with Arc, because a Box can not be cloned.
+    semaphore: Arc<Semaphore>,
+}
+
+impl Clone for Listener {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            semaphore: self.semaphore.clone(),
+        }
+    }
+}
+
+impl Listener {
+    pub fn new(listener: Arc<dyn BrokerListener>) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(listener.concurrent_ack())),
+            inner: listener,
+        }
+    }
+
+    fn listener(&self) -> &Arc<dyn BrokerListener> {
+        &self.inner
+    }
+
+    fn max_concurrent(&self) -> usize {
+        self.inner.concurrent_ack()
+    }
+}
+
 pub struct Consumer {
     channel: Option<Channel>,
     consumer: Option<lapin::Consumer>,
-    listeners: Vec<Arc<dyn BrokerListener>>, // Replace Box with Arc, because a Box can not be cloned.
+    listeners: Option<Vec<Listener>>,
 }
 
 impl Consumer {
@@ -208,7 +261,7 @@ impl Consumer {
         Self {
             channel: None,
             consumer: None,
-            listeners: vec![],
+            listeners: Some(vec![]),
         }
     }
 
@@ -223,17 +276,16 @@ impl Consumer {
     /// Add and store listeners
     /// When a listener is added, it will bind the queue to the specified exchange name.
     pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
-        self.listeners.push(listener);
+        self.listeners.as_mut().expect("No listeners found").push(Listener::new(listener));
     }
 
-    pub fn spawn(&self) -> JoinHandle<Result<()>> {
-        // loop {
+    pub fn spawn(&mut self) -> JoinHandle<Result<()>> {
         let consumer = self
             .consumer
             .as_ref()
             .expect("A consumer hasn't been set.")
             .clone();
-        let listeners = self.listeners.clone();
+        let listeners = self.listeners.take().expect("No listeners found");
 
         let handle = task::spawn(Consumer::consume(consumer, listeners));
 
@@ -245,7 +297,7 @@ impl Consumer {
     /// Consume messages by finding the appropriated listener.
     pub async fn consume(
         mut consumer: lapin::Consumer,
-        listeners: Vec<Arc<dyn BrokerListener>>,
+        listeners: Vec<Listener>,
     ) -> Result<()> {
         debug!("Broker consuming...");
         while let Some(message) = consumer.next().await {
@@ -254,23 +306,36 @@ impl Consumer {
                     // info!("received message: {:?}", delivery);
                     let listener = listeners
                         .iter()
-                        .find(|listener| listener.exchange_name() == delivery.exchange.as_str());
+                        .find(|listener| listener.listener().exchange_name() == delivery.exchange.as_str());
 
                     if let Some(listener) = listener {
                         // Listener found, try to consume the delivery
                         let listener = listener.clone();
+                        let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
+                        debug!("waiting for a permit ({}/{} available)", permits_available, listener.max_concurrent());
+                        STAT_CONCURRENT_CHECK
+                            .with_label_values(&["permits_available"])
+                            .set(permits_available);
+                        STAT_CONCURRENT_CHECK
+                            .with_label_values(&["max"])
+                            .set(listener.max_concurrent() as i64);
+
+                        let permit = listener.semaphore.clone();
+                        let permit = permit.acquire_owned().await?;
+                        debug!("Got a permit, we can start to check");
 
                         // consume the delivery asynchronously
-                        task::spawn(consume_async(delivery, listener, channel));
+                        // todo: if max_concurrent == 1, don't need to spawn a task
+                        task::spawn(consume_async(delivery, listener, channel, permit));
                     } else {
                         // No listener found for that exchange
                         if let Err(err) = channel
                             .basic_nack(delivery.delivery_tag, BasicNackOptions::default())
                             .await
                         {
-                            error!("Can't find any registered listeners for `{}` exchange: {:?} + Failed to send nack: {}", &delivery.exchange, &delivery, err);
+                            panic!("Can't find any registered listeners for `{}` exchange: {:?} + Failed to send nack: {}", &delivery.exchange, &delivery, err);
                         } else {
-                            error!(
+                            panic!(
                                 "Can't find any registered listeners for `{}` exchange: {:?}",
                                 &delivery.exchange, &delivery
                             );
@@ -297,31 +362,38 @@ impl Clone for Consumer {
     }
 }
 
+// async fn consume_async<L: BrokerListener + ?Sized>(
+//     delivery: Delivery,
+//     listener: Arc<L>,
+//     channel: Channel,
+// ) {
 /// Consume the delivery async
-async fn consume_async<L: BrokerListener + ?Sized>(
+async fn consume_async(
     delivery: Delivery,
-    listener: Arc<L>,
+    listener: Listener,
     channel: Channel,
+    permit: OwnedSemaphorePermit,
 ) {
     let delivery_tag = delivery.delivery_tag;
 
-    if let Err(err) = listener.consume(delivery).await {
+    let res = listener.listener().consume(delivery).await;
+    drop(permit); // release the permit immediately
+
+    // Then send the AMQP `ACK` or `NCK`
+    if let Err(err) = res {
         // Consumption triggered an error, we send a NACK
         if let Err(err) = channel
-            .basic_nack(delivery_tag, BasicNackOptions::default())
+            .basic_nack(delivery_tag, BasicNackOptions::default()) // can spawn this ASYNC
             .await
         {
             error!("Broker failed to send NACK: {:?}", err);
         } else {
-            error!(
-                "Error during consumption of a delivery: {:?}, NACK sent",
-                err
-            );
+            error!("Error during consumption of a delivery: {:?}, NACK sent", err);
         }
     } else {
         // Consumption went fine, we send ACK
         if let Err(err) = channel
-            .basic_ack(delivery_tag, BasicAckOptions::default())
+            .basic_ack(delivery_tag, BasicAckOptions::default()) // can spawn this ASYNC
             .await
         {
             error!(
