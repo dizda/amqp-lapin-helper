@@ -24,7 +24,7 @@ pub mod types {
 use async_trait::async_trait;
 use bincode::ErrorKind;
 use futures_lite::StreamExt;
-use lapin::publisher_confirm::Confirmation;
+use lapin::publisher_confirm::{Confirmation, PublisherConfirm};
 use serde::Serialize;
 use std::sync::Arc;
 use once_cell::sync::Lazy;
@@ -36,15 +36,10 @@ use tokio_amqp::*;
 
 pub type Result<E> = std::result::Result<E, Error>;
 
-/// It's not possible to get the binary name at compile time, so we get it here at runtime
-static BINARY_NAME: Lazy<String> = Lazy::new(|| {
-    format!("{}", std::env::current_exe().unwrap().iter().last().expect("can't find the name").to_string_lossy())
-});
-
 static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
         opts!(
-            format!("{}_{}", *BINARY_NAME, "consumer_concurrent_tasks"), // will generate `consumer_peer_check_consumer_concurrent_tasks`
+            "amqp_consumer_concurrent_tasks",
             "Current/Max concurrent check",
         ),
         &["exchange_name", "kind"],
@@ -57,9 +52,18 @@ const EXPONENTIAL_SECONDS: &[f64] = &[
 
 static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     register_histogram_vec!(
-        format!("{}_{}", *BINARY_NAME, "consumer_duration"),
+        "amqp_consumer_duration",
         "The duration of the consumer",
         &["exchange_name"],
+        EXPONENTIAL_SECONDS.to_vec(),
+    ).unwrap()
+});
+
+static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "amqp_publisher_duration",
+        "The duration of the publisher",
+        &["exchange_name", "routing_key"],
         EXPONENTIAL_SECONDS.to_vec(),
     ).unwrap()
 });
@@ -77,6 +81,9 @@ pub enum Error {
 
     #[error("String UTF-8 error: {0}")]
     StringUtf8Error(#[from] std::string::FromUtf8Error),
+
+    #[error("Bincode: {0}")]
+    Bincode(#[from] bincode::Error),
 
     #[error("SerdeJson: {0}")]
     SerdeJson(#[from] serde_json::Error),
@@ -104,7 +111,7 @@ pub trait BrokerListener: Send + Sync {
     }
 
     /// The method that will be called in the struct impl on every messages received
-    async fn consume(&self, delivery: Delivery) -> Result<()>;
+    async fn consume(&self, delivery: &Delivery) -> Result<()>;
 }
 
 /// AMQP Client
@@ -150,19 +157,19 @@ impl Broker {
         Ok(&mut self.consumer)
     }
 
-    pub async fn publish<P>(&self, entity: &P, routing_key: &str)
+    pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<PublisherConfirm>
     where
         P: BrokerPublish + Serialize,
     {
-        self.publisher.publish(entity, routing_key).await;
+        self.publisher.publish(entity, routing_key).await
     }
 
     pub async fn publish_raw(
         &self,
         exchange: &str,
         routing_key: &str,
-        msg: Vec<u8>,
-    ) -> Result<Confirmation> {
+        msg: &[u8],
+    ) -> Result<PublisherConfirm> {
         self.publisher.publish_raw(exchange, routing_key, msg).await
     }
 }
@@ -181,14 +188,14 @@ impl Publisher {
     }
 
     /// Push item into amqp
-    pub async fn publish<P>(&self, entity: &P, routing_key: &str)
+    pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<PublisherConfirm>
     where
         P: BrokerPublish + Serialize,
     {
-        let serialized = match bincode::serialize(entity) {
-            Ok(msg) => msg,
-            Err(e) => return error!("Unable to serialize msg: {}", e),
-        };
+        let serialized = bincode::serialize(entity)?;
+
+        // start prometheus duration timer
+        let histogram_timer = STAT_PUBLISHER_DURATION.with_label_values(&[entity.exchange_name(), routing_key]).start_timer();
 
         let res = self
             .channel()
@@ -196,16 +203,15 @@ impl Publisher {
                 entity.exchange_name(),
                 routing_key,
                 BasicPublishOptions::default(),
-                serialized,
+                serialized.as_slice(),
                 BasicProperties::default(),
             )
             .await;
 
-        if let Err(ref err) = res {
-            // What shall we do, here?! as we can not break the publish method if we use `?`
-            error!("Unable to publish msg: {}", err);
-        }
-        // no need to use the confirmation because ConfirmNotRequested (we don't need it for now)
+        // finish and compute the duration to prometheus
+        histogram_timer.observe_duration();
+
+        res.map_err(|e| Error::Amqp(e))
     }
 
     /// Push without serializing
@@ -213,8 +219,11 @@ impl Publisher {
         &self,
         exchange: &str,
         routing_key: &str,
-        msg: Vec<u8>,
-    ) -> Result<Confirmation> {
+        msg: &[u8],
+    ) -> Result<PublisherConfirm> {
+        // start prometheus duration timer
+        let histogram_timer = STAT_PUBLISHER_DURATION.with_label_values(&[exchange, routing_key]).start_timer();
+
         let res = self
             .channel()
             .basic_publish(
@@ -224,10 +233,13 @@ impl Publisher {
                 msg,
                 BasicProperties::default(),
             )
-            .await?;
+            .await;
 
-        let res = res.await?;
-        Ok(res)
+        // finish and compute the duration to prometheus
+        histogram_timer.observe_duration();
+
+        // let res = res.await?;
+        res.map_err(|e| Error::Amqp(e))
     }
 }
 
@@ -322,7 +334,7 @@ impl Consumer {
         debug!("Broker consuming...");
         while let Some(message) = consumer.next().await {
             match message {
-                Ok((channel, delivery)) => {
+                Ok(delivery) => {
                     // info!("received message: {:?}", delivery);
                     let listener = listeners
                         .iter()
@@ -345,11 +357,10 @@ impl Consumer {
                         debug!("Got a permit, we can start to check");
 
                         // consume the delivery asynchronously
-                        task::spawn(consume_async(delivery, listener, channel, permit));
+                        task::spawn(consume_async(delivery, listener, permit));
                     } else {
                         // No listener found for that exchange
-                        if let Err(err) = channel
-                            .basic_nack(delivery.delivery_tag, BasicNackOptions::default())
+                        if let Err(err) = delivery.nack(BasicNackOptions::default())
                             .await
                         {
                             panic!("Can't find any registered listeners for `{}` exchange: {:?} + Failed to send nack: {}", &delivery.exchange, &delivery, err);
@@ -390,16 +401,13 @@ impl Clone for Consumer {
 async fn consume_async(
     delivery: Delivery,
     listener: Listener,
-    channel: Channel,
     permit: OwnedSemaphorePermit,
 ) {
-    let delivery_tag = delivery.delivery_tag;
-
     // start prometheus duration timer
     let histogram_timer = STAT_CONSUMER_DURATION.with_label_values(&[listener.inner.exchange_name()]).start_timer();
 
     // launch the consumer
-    let res = listener.listener().consume(delivery).await;
+    let res = listener.listener().consume(&delivery).await;
     drop(permit); // release the permit immediately
 
     // finish and compute the duration to prometheus
@@ -409,8 +417,8 @@ async fn consume_async(
     // Then send the AMQP `ACK` or `NCK`
     if let Err(err) = res {
         // Consumption triggered an error, we send a NACK
-        if let Err(err) = channel
-            .basic_nack(delivery_tag, BasicNackOptions::default()) // can spawn this ASYNC
+        if let Err(err) = delivery
+            .nack(BasicNackOptions::default()) // can spawn this ASYNC
             .await
         {
             error!("Broker failed to send NACK: {:?}", err);
@@ -419,8 +427,8 @@ async fn consume_async(
         }
     } else {
         // Consumption went fine, we send ACK
-        if let Err(err) = channel
-            .basic_ack(delivery_tag, BasicAckOptions::default()) // can spawn this ASYNC
+        if let Err(err) = delivery
+            .ack( BasicAckOptions::default()) // can spawn this ASYNC
             .await
         {
             error!(
