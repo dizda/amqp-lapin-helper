@@ -89,7 +89,7 @@ pub enum Error {
     SerdeJson(#[from] serde_json::Error),
 
     #[error("Consumer: {0}")]
-    ConsumerError(#[from] anyhow::Error),
+    ConsumerError(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Tag an object as Publishable
