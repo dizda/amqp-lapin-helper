@@ -1,6 +1,6 @@
 #[forbid(unsafe_code)]
 #[macro_use]
-extern crate log;
+extern crate tracing;
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -34,7 +34,10 @@ use tokio::task;
 use tokio::task::JoinHandle;
 use tokio_amqp::*;
 
+pub type Requeue = bool;
+
 pub type Result<E> = std::result::Result<E, Error>;
+pub type ConsumeResult<E> = std::result::Result<E, Requeue>;
 
 static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
     register_int_gauge_vec!(
@@ -111,7 +114,9 @@ pub trait BrokerListener: Send + Sync {
     }
 
     /// The method that will be called in the struct impl on every messages received
-    async fn consume(&self, delivery: &Delivery) -> Result<()>;
+    /// Err(false): reject.requeue = false
+    /// Err(true): reject.requeue = true
+    async fn consume(&self, delivery: &Delivery) -> std::result::Result<(), bool>;
 }
 
 /// AMQP Client
@@ -344,10 +349,7 @@ impl Consumer {
                         // Listener found, try to consume the delivery
                         let listener = listener.clone();
                         let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
-                        debug!("waiting for a permit ({}/{} available)", permits_available, listener.max_concurrent_tasks());
-                        STAT_CONCURRENT_TASK
-                            .with_label_values(&[delivery.exchange.as_str(), "permits_available"])
-                            .set(permits_available);
+                        debug!("waiting for a permit ({}/{} available)", permits_available, permits_max = listener.max_concurrent_tasks());
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "max"])
                             .set(listener.max_concurrent_tasks() as i64);
@@ -355,6 +357,10 @@ impl Consumer {
                         let permit = listener.semaphore.clone();
                         let permit = permit.acquire_owned().await?;
                         debug!("Got a permit, we can start to check");
+
+                        STAT_CONCURRENT_TASK
+                            .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
+                            .inc();
 
                         // consume the delivery asynchronously
                         task::spawn(consume_async(delivery, listener, permit));
@@ -372,9 +378,9 @@ impl Consumer {
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Error when receiving a delivery: {}", e);
-                    Err(e)? // force the binary to shutdown on any AMQP error received
+                Err(err) => {
+                    error!(%err, "Error when receiving a delivery");
+                    Err(err)? // force the binary to shutdown on any AMQP error received
                 }
             }
         }
@@ -410,30 +416,27 @@ async fn consume_async(
     let res = listener.listener().consume(&delivery).await;
     drop(permit); // release the permit immediately
 
+    STAT_CONCURRENT_TASK
+        .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
+        .dec();
+
     // finish and compute the duration to prometheus
     histogram_timer.observe_duration();
 
+    if let Err(requeue) = res {
+        let mut options = BasicRejectOptions::default();
+        options.requeue = requeue;
 
-    // Then send the AMQP `ACK` or `NCK`
-    if let Err(err) = res {
-        // Consumption triggered an error, we send a NACK
-        if let Err(err) = delivery
-            .nack(BasicNackOptions::default()) // can spawn this ASYNC
-            .await
-        {
-            error!("Broker failed to send NACK: {:?}", err);
+        if let Err(err_reject) = delivery.reject(options).await {
+            error!(requeue, %err_reject, "Broker failed to send REJECT");
         } else {
-            error!("Error during consumption of a delivery: {:?}, NACK sent", err);
+            error!(requeue, "Error during consumption of a delivery, REJECT sent");
         }
     } else {
         // Consumption went fine, we send ACK
-        if let Err(err) = delivery
-            .ack( BasicAckOptions::default()) // can spawn this ASYNC
-            .await
-        {
+        if let Err(err) = delivery.ack( BasicAckOptions::default()).await {
             error!(
-                "Broker's listener completed, but failed to send ACK back to the broker: {}",
-                err
+                %err, "Delivery consumed, but failed to send ACK back to the broker",
             );
         }
     }
