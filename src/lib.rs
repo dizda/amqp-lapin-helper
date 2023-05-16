@@ -87,9 +87,6 @@ pub enum Error {
     #[error("Bincode: {0}")]
     Bincode(#[from] bincode::Error),
 
-    #[error("SerdeJson: {0}")]
-    SerdeJson(#[from] serde_json::Error),
-
     #[error("Consumer: {0}")]
     ConsumerError(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
