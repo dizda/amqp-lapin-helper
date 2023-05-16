@@ -316,6 +316,7 @@ impl Consumer {
         self.listeners.as_mut().expect("No listeners found").push(Listener::new(listener));
     }
 
+    /// Will spawn the Consumer automatically
     pub fn spawn(&mut self) -> JoinHandle<Result<()>> {
         let consumer = self
             .consumer
@@ -329,6 +330,18 @@ impl Consumer {
         info!("Consumer has been launched in background.");
 
         handle
+    }
+
+    /// In order to spawn it manually.
+    pub fn get_consumer(&mut self) -> Consumer {
+        let consumer = self
+            .consumer
+            .as_ref()
+            .expect("A consumer hasn't been set.")
+            .clone();
+        let listeners = self.listeners.take().expect("No listeners found");
+
+        Consumer::consume(consumer, listeners)
     }
 
     /// Consume messages by finding the appropriated listener.
