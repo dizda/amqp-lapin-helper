@@ -2,7 +2,6 @@
 #[macro_use]
 extern crate tracing;
 
-use std::ffi::OsStr;
 use std::path::Path;
 pub use lapin::{
     message::Delivery, options::*, types::*, BasicProperties, Channel, Connection,
@@ -333,7 +332,7 @@ impl Consumer {
     }
 
     /// In order to spawn it manually.
-    pub fn get_consumer(&mut self) -> Consumer {
+    pub fn get_consumer(&mut self) -> (lapin::Consumer, Vec<Listener>) {
         let consumer = self
             .consumer
             .as_ref()
@@ -341,7 +340,7 @@ impl Consumer {
             .clone();
         let listeners = self.listeners.take().expect("No listeners found");
 
-        Consumer::consume(consumer, listeners)
+        (consumer, listeners)
     }
 
     /// Consume messages by finding the appropriated listener.
