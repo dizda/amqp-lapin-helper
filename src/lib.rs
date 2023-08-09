@@ -439,7 +439,11 @@ async fn consume_async(
         if let Err(err_reject) = delivery.reject(options).await {
             error!(requeue, %err_reject, "Broker failed to send REJECT");
         } else {
-            error!(requeue, "Error during consumption of a delivery, REJECT sent");
+            let exchange_name = listener.inner.exchange_name();
+            let routing_key = delivery.routing_key;
+            let redelivered = delivery.redelivered;
+
+            warn!(requeue, %exchange_name, %routing_key, %redelivered, "Error during consumption of a delivery, `REJECT` sent");
         }
     } else {
         // Consumption went fine, we send ACK
