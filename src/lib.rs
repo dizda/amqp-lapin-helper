@@ -2,10 +2,9 @@
 #[macro_use]
 extern crate tracing;
 
-use std::path::Path;
 pub use lapin::{
     message::Delivery, options::*, types::*, BasicProperties, Channel, Connection,
-    ConnectionProperties, ExchangeKind, Queue,
+    ConnectionProperties, ExchangeKind, Queue, Consumer as LapinConsumer
 };
 
 pub mod message {
@@ -21,16 +20,17 @@ pub mod types {
 }
 
 use async_trait::async_trait;
-use bincode::ErrorKind;
 use futures_lite::StreamExt;
-use lapin::publisher_confirm::{Confirmation, PublisherConfirm};
+use lapin::publisher_confirm::{ PublisherConfirm};
 use serde::Serialize;
 use std::sync::Arc;
+use std::time::Duration;
 use once_cell::sync::Lazy;
-use prometheus::{Histogram, HistogramVec, IntGaugeVec, opts, register_histogram, register_histogram_vec, register_int_gauge_vec};
-use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use prometheus::{HistogramVec, IntGaugeVec, opts, register_histogram_vec, register_int_gauge_vec};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::task;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tokio_amqp::*;
 
 pub type Requeue = bool;
@@ -115,47 +115,58 @@ pub trait BrokerListener: Send + Sync {
     async fn consume(&self, delivery: &Delivery) -> std::result::Result<(), bool>;
 }
 
+#[async_trait]
+pub trait BrokerManager {
+    async fn declare_publisher(channel: &Channel) -> Result<()>;
+    async fn declare_consumer(channel: &Channel)-> Result<lapin::Consumer>;
+}
+
 /// AMQP Client
-pub struct Broker {
+pub struct Broker<M: BrokerManager> {
     conn: Option<Connection>,
     publisher: Publisher,
     consumer: Consumer,
+    manager: M,
+    uri: String,
 }
 
-impl Broker {
-    pub fn new() -> Self {
+impl<M: BrokerManager> Broker<M> {
+    pub fn new(uri: &str, manager: M) -> Self {
         Self {
             conn: None,
             publisher: Publisher::new(),
             consumer: Consumer::new(),
+            uri: uri.to_owned(),
+            manager,
         }
     }
 
     /// Connect `Broker` to the AMQP endpoint, then declare Proxy's queue.
-    pub async fn init(&mut self, uri: &str) -> Result<()> {
-        let conn = Connection::connect(uri, ConnectionProperties::default().with_tokio()).await?;
+    pub async fn init(&mut self) -> Result<()> {
+        let conn = Connection::connect(&self.uri, ConnectionProperties::default().with_tokio()).await?;
 
-        info!("Broker connected.");
+        // Create Publisher
+        let channel = conn.create_channel().await?;
+        M::declare_publisher(&channel).await?;
+        self.publisher.channel = Some(channel); // not sure whether that is required or not
+
+        // Create Consumer
+        let channel = conn.create_channel().await?;
+        let consumer = M::declare_consumer(&channel).await?;
+        self.consumer.channel = Some(channel); // not sure whether that is required or not
+        self.consumer.consumer = Some(consumer);
+
+        info!("Broker connected, channels created.");
 
         self.conn = Some(conn);
 
         Ok(())
     }
 
-    /// Setup publisher
-    pub async fn setup_publisher(&mut self) -> Result<&Publisher> {
-        let channel = self.conn.as_ref().unwrap().create_channel().await?;
-        self.publisher.channel = Some(channel);
-
-        Ok(&self.publisher)
-    }
-
-    /// Init the consumer then return a mut instance in case we need to make more bindings
-    pub async fn setup_consumer(&mut self) -> Result<&mut Consumer> {
-        let channel = self.conn.as_ref().unwrap().create_channel().await?;
-        self.consumer.channel = Some(channel);
-
-        Ok(&mut self.consumer)
+    /// Add and store listeners
+    /// When a listener is added, it will bind the queue to the specified exchange name.
+    pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
+        self.consumer.listeners.as_mut().expect("No listeners found").push(Listener::new(listener));
     }
 
     pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<PublisherConfirm>
@@ -172,6 +183,28 @@ impl Broker {
         msg: &[u8],
     ) -> Result<PublisherConfirm> {
         self.publisher.publish_raw(exchange, routing_key, msg).await
+    }
+
+    /// Spawn the consumer and retry on connection interruption
+    pub async fn spawn(&mut self) {
+        loop {
+            if let Err(err) = self.init().await {
+                error!(%err, "amqp connection failed");
+                sleep(Duration::from_millis(1000)).await;
+                continue; // retry connection before hitting the spawn
+            } else {
+                info!("connected to amqp");
+            }
+
+            if let Err(err) = self.consumer.spawn().await {
+                error!(%err, "consumer failed, tries to reconnect..");
+            }
+
+        }
+    }
+
+    pub fn publisher(&self) -> &Publisher {
+        &self.publisher
     }
 }
 
@@ -319,7 +352,7 @@ impl Consumer {
             .as_ref()
             .expect("A consumer hasn't been set.")
             .clone();
-        let listeners = self.listeners.take().expect("No listeners found");
+        let listeners = self.listeners.clone().expect("No listeners found"); //todo: remove the Option
 
         let handle = task::spawn(Consumer::consume(consumer, listeners));
 
@@ -345,7 +378,8 @@ impl Consumer {
         mut consumer: lapin::Consumer,
         listeners: Vec<Listener>,
     ) -> Result<()> {
-        debug!("Broker consuming...");
+        info!(listeners = %listeners.len(), "Broker consuming...");
+
         while let Some(message) = consumer.next().await {
             match message {
                 Ok(delivery) => {
