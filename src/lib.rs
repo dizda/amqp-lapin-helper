@@ -166,7 +166,6 @@ impl<M: BrokerManager> Broker<M> {
         // Create Consumer
         let channel = conn.create_channel().await?;
         let amqp_consumer = M::declare_consumer(&channel).await?;
-        self.consumer.channel = Some(channel); // not sure whether that is required or not
         self.consumer.consumer = Some(amqp_consumer);
 
         info!("Broker connected, channels created.");
@@ -368,7 +367,6 @@ impl Listener {
 }
 
 pub struct Consumer {
-    channel: Option<Channel>,
     consumer: Option<lapin::Consumer>,
     listeners: Option<Vec<Listener>>,
 }
@@ -376,7 +374,6 @@ pub struct Consumer {
 impl Consumer {
     pub fn new() -> Self {
         Self {
-            channel: None,
             consumer: None,
             listeners: Some(vec![]),
         }
@@ -451,7 +448,6 @@ impl Consumer {
 impl Clone for Consumer {
     fn clone(&self) -> Self {
         Self {
-            channel: self.channel.clone(),
             consumer: self.consumer.clone(),
             listeners: self.listeners.clone(),
         }
