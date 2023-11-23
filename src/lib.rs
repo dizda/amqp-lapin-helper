@@ -313,6 +313,7 @@ impl PublisherQueue {
     pub async fn publish(&mut self) -> Result<()> {
         while let Some(msg) = self.recv.recv().await {
             self.send(msg).await?; // todo: spawn a task here?
+            debug!("message sent to amqp");
         }
 
         Ok(())
@@ -390,13 +391,17 @@ impl Consumer {
 
     /// Consume messages by finding the appropriated listener.
     pub async fn consume(&mut self) -> Result<()> {
-        info!(listeners = %self.listeners.unwrap().len(), "Broker consuming...");
+        let listeners = self
+            .listeners
+            .as_ref()
+            .expect("There's no listener in the Consumer");
+        info!(listeners = %listeners.len(), "Broker consuming...");
 
-        while let Some(message) = self.consumer.as_ref().unwrap().next().await {
+        while let Some(message) = self.consumer.as_mut().unwrap().next().await {
             match message {
                 Ok(delivery) => {
                     // info!("received message: {:?}", delivery);
-                    let listener = self.listeners.as_ref().unwrap().iter().find(|listener| {
+                    let listener = listeners.iter().find(|listener| {
                         listener.listener().exchange_name() == delivery.exchange.as_str()
                     });
 
