@@ -209,21 +209,17 @@ impl<M: BrokerManager> Broker<M> {
             }
 
             tokio::select! {
-                err = self.consumer.spawn() => {
+                err = self.consumer.consume() => {
                     if let Err(err) = &err {
                         error!(%err, "amqp consumer failed, trying to reconnect..");
                     }
                 }
-                err = self.publisher_queue.spawn() => {
+                err = self.publisher_queue.publish() => {
                     if let Err(err) = &err {
                         error!(%err, "amqp publisher failed, trying to reconnect..");
                     }
                 }
             }
-
-            // if let Err(err) = self.consumer.spawn().await {
-            //     error!(%err, "consumer failed, tries to reconnect..");
-            // }
         }
     }
 
@@ -315,7 +311,7 @@ impl PublisherQueue {
     }
 
     /// Process the messages from the queue to AMQP
-    pub async fn spawn(&mut self) -> Result<()> {
+    pub async fn publish(&mut self) -> Result<()> {
         while let Some(msg) = self.recv.recv().await {
             self.send(msg).await?; // todo: spawn a task here?
         }
@@ -395,31 +391,15 @@ impl Consumer {
             .push(Listener::new(listener));
     }
 
-    /// Will spawn the Consumer automatically
-    pub fn spawn(&mut self) -> JoinHandle<Result<()>> {
-        let consumer = self
-            .consumer
-            .as_ref()
-            .expect("A consumer hasn't been set.")
-            .clone();
-        let listeners = self.listeners.clone().expect("No listeners found"); //todo: remove the Option
-
-        let handle = task::spawn(Consumer::consume(consumer, listeners));
-
-        info!("Consumer has been launched in background.");
-
-        handle
-    }
-
     /// Consume messages by finding the appropriated listener.
-    pub async fn consume(mut consumer: lapin::Consumer, listeners: Vec<Listener>) -> Result<()> {
-        info!(listeners = %listeners.len(), "Broker consuming...");
+    pub async fn consume(&mut self) -> Result<()> {
+        info!(listeners = %self.listeners.unwrap().len(), "Broker consuming...");
 
-        while let Some(message) = consumer.next().await {
+        while let Some(message) = self.consumer.as_ref().unwrap().next().await {
             match message {
                 Ok(delivery) => {
                     // info!("received message: {:?}", delivery);
-                    let listener = listeners.iter().find(|listener| {
+                    let listener = self.listeners.as_ref().unwrap().iter().find(|listener| {
                         listener.listener().exchange_name() == delivery.exchange.as_str()
                     });
 
