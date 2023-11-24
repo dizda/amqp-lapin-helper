@@ -122,8 +122,10 @@ pub trait BrokerListener: Send + Sync {
 
 #[async_trait]
 pub trait BrokerManager {
-    async fn declare_publisher(channel: &Channel) -> Result<()>;
-    async fn declare_consumer(channel: &Channel) -> Result<lapin::Consumer>;
+    async fn declare_publisher(&self, channel: &Channel) -> Result<()>;
+
+    /// Consumer's declaration is not required, some apps only need a publisher, vice & versa
+    async fn declare_consumer(&self, channel: &Channel) -> Result<Option<lapin::Consumer>>;
 }
 
 /// AMQP Client
@@ -160,13 +162,13 @@ impl<M: BrokerManager> Broker<M> {
 
         // Create Publisher
         let channel = conn.create_channel().await?;
-        M::declare_publisher(&channel).await?;
+        self.manager.declare_publisher(&channel).await?;
         self.publisher_queue.channel = Some(channel); // not sure whether that is required or not
 
         // Create Consumer
         let channel = conn.create_channel().await?;
-        let amqp_consumer = M::declare_consumer(&channel).await?;
-        self.consumer.consumer = Some(amqp_consumer);
+        let amqp_consumer = self.manager.declare_consumer(&channel).await?;
+        self.consumer.consumer = amqp_consumer;
 
         info!("Broker connected, channels created.");
 
@@ -178,22 +180,18 @@ impl<M: BrokerManager> Broker<M> {
     /// Add and store listeners
     /// When a listener is added, it will bind the queue to the specified exchange name.
     pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
-        self.consumer
-            .listeners
-            .as_mut()
-            .expect("No listeners found")
-            .push(Listener::new(listener));
+        self.consumer.listeners.push(Listener::new(listener));
     }
 
-    pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<()>
+    pub fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<()>
     where
         P: BrokerPublish + Serialize,
     {
-        self.publisher.publish(entity, routing_key).await
+        self.publisher.publish(entity, routing_key)
     }
 
-    pub async fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
-        self.publisher.publish_raw(exchange, routing_key, msg).await
+    pub fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
+        self.publisher.publish_raw(exchange, routing_key, msg)
     }
 
     /// Spawn the consumer and retry on connection interruption
@@ -245,8 +243,7 @@ impl Publisher {
     }
 
     /// Push item into memory queue before pushing it to amqp
-    /// TODO: remove the async here!
-    pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<()>
+    pub fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<()>
     where
         P: BrokerPublish + Serialize,
     {
@@ -262,7 +259,7 @@ impl Publisher {
     }
 
     /// Push without serializing, serializing has been made before calling this function
-    pub async fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
+    pub fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
         self.tx
             .send(QueueMessage::new(exchange, routing_key, msg.to_owned()))?;
 
@@ -369,39 +366,42 @@ impl Listener {
 
 pub struct Consumer {
     consumer: Option<lapin::Consumer>,
-    listeners: Option<Vec<Listener>>,
+    listeners: Vec<Listener>,
 }
 
 impl Consumer {
     pub fn new() -> Self {
         Self {
             consumer: None,
-            listeners: Some(vec![]),
+            listeners: vec![],
         }
     }
 
     /// Add and store listeners
     /// When a listener is added, it will bind the queue to the specified exchange name.
     pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
-        self.listeners
-            .as_mut()
-            .expect("No listeners found")
-            .push(Listener::new(listener));
+        self.listeners.push(Listener::new(listener));
     }
 
     /// Consume messages by finding the appropriated listener.
     pub async fn consume(&mut self) -> Result<()> {
-        let listeners = self
-            .listeners
-            .as_ref()
-            .expect("There's no listener in the Consumer");
-        info!(listeners = %listeners.len(), "Broker consuming...");
+        if self.listeners.len() == 0 || self.consumer.is_none() {
+            warn!("No listeners have been found, nothing will be consumed from amqp.");
+
+            loop {
+                // in case there's no listeners, in order to avoid breaking
+                // the job spawn for the publisher, we make an infinite loop here.
+                sleep(Duration::from_secs(1)).await;
+            }
+        } else {
+            info!(listeners = %self.listeners.len(), "Broker consuming...");
+        }
 
         while let Some(message) = self.consumer.as_mut().unwrap().next().await {
             match message {
                 Ok(delivery) => {
                     // info!("received message: {:?}", delivery);
-                    let listener = listeners.iter().find(|listener| {
+                    let listener = self.listeners.iter().find(|listener| {
                         listener.listener().exchange_name() == delivery.exchange.as_str()
                     });
 
