@@ -22,7 +22,10 @@ pub mod types {
 use async_trait::async_trait;
 use futures_lite::StreamExt;
 use once_cell::sync::Lazy;
-use prometheus::{opts, register_histogram_vec, register_int_gauge_vec, HistogramVec, IntGaugeVec};
+use prometheus::{
+    opts, register_gauge_vec, register_histogram_vec, register_int_gauge_vec, GaugeVec,
+    HistogramVec, IntGaugeVec,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +71,15 @@ static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
         "The duration of the publisher",
         &["exchange_name", "routing_key"],
         EXPONENTIAL_SECONDS.to_vec(),
+    )
+    .unwrap()
+});
+
+static STAT_PUBLISHER_MSG_QUEUE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "amqp_publisher_msg_queue",
+        "The number of messages pending in the queue",
+        &["exchange_name", "routing_key"],
     )
     .unwrap()
 });
@@ -257,6 +269,10 @@ impl Publisher {
             serialized,
         ))?;
 
+        STAT_PUBLISHER_MSG_QUEUE
+            .with_label_values(&[entity.exchange_name(), routing_key])
+            .inc();
+
         Ok(())
     }
 
@@ -264,6 +280,10 @@ impl Publisher {
     pub fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
         self.tx
             .send(QueueMessage::new(exchange, routing_key, msg.to_owned()))?;
+
+        STAT_PUBLISHER_MSG_QUEUE
+            .with_label_values(&[exchange, routing_key])
+            .inc();
 
         Ok(())
     }
@@ -311,6 +331,11 @@ impl PublisherQueue {
 
                 // finish and compute the duration to prometheus
                 histogram_timer.observe_duration();
+
+                // decrement the gauge about the number of pending msg in the queue
+                STAT_PUBLISHER_MSG_QUEUE
+                    .with_label_values(&[&msg.exchange, &msg.routing_key])
+                    .dec();
 
                 if let Err(err) = res {
                     error!(%err, "failed to publish an amqp message");
