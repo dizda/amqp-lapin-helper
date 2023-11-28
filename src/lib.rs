@@ -2,10 +2,9 @@
 #[macro_use]
 extern crate tracing;
 
-use std::path::Path;
 pub use lapin::{
     message::Delivery, options::*, types::*, BasicProperties, Channel, Connection,
-    ConnectionProperties, ExchangeKind, Queue,
+    ConnectionProperties, Consumer as LapinConsumer, ExchangeKind, Queue,
 };
 
 pub mod message {
@@ -21,17 +20,20 @@ pub mod types {
 }
 
 use async_trait::async_trait;
-use bincode::ErrorKind;
 use futures_lite::StreamExt;
-use lapin::publisher_confirm::{Confirmation, PublisherConfirm};
+use once_cell::sync::Lazy;
+use prometheus::{
+    opts, register_gauge_vec, register_histogram_vec, register_int_gauge_vec, GaugeVec,
+    HistogramVec, IntGaugeVec,
+};
 use serde::Serialize;
 use std::sync::Arc;
-use once_cell::sync::Lazy;
-use prometheus::{Histogram, HistogramVec, IntGaugeVec, opts, register_histogram, register_histogram_vec, register_int_gauge_vec};
-use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
+use std::time::Duration;
+use tokio::sync::mpsc::error::SendError;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::task;
-use tokio::task::JoinHandle;
-use tokio_amqp::*;
+use tokio::time::sleep;
 
 pub type Requeue = bool;
 
@@ -45,7 +47,8 @@ static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
             "Current/Max concurrent check",
         ),
         &["exchange_name", "kind"],
-    ).unwrap()
+    )
+    .unwrap()
 });
 
 const EXPONENTIAL_SECONDS: &[f64] = &[
@@ -58,7 +61,8 @@ static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
         "The duration of the consumer",
         &["exchange_name"],
         EXPONENTIAL_SECONDS.to_vec(),
-    ).unwrap()
+    )
+    .unwrap()
 });
 
 static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
@@ -67,26 +71,36 @@ static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
         "The duration of the publisher",
         &["exchange_name", "routing_key"],
         EXPONENTIAL_SECONDS.to_vec(),
-    ).unwrap()
+    )
+    .unwrap()
 });
+
+static STAT_PUBLISHER_MSG_QUEUE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "amqp_publisher_msg_queue",
+        "The number of messages pending in the queue",
+        &["exchange_name", "routing_key"],
+    )
+    .unwrap()
+});
+
+/// The reconnection delay when it detects an amqp disconnection
+const RECONNECTION_DELAY: Duration = Duration::from_millis(1000);
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("MpscSendError: {0}")]
+    SendError(#[from] SendError<QueueMessage>),
     #[error("acquire-semaphore: {0}")]
     AcquireSemaphore(#[from] AcquireError),
-
     #[error("AMQP: {0}")]
     Amqp(#[from] lapin::Error),
-
     #[error("Missing server ID")]
     MissingServerId,
-
     #[error("String UTF-8 error: {0}")]
     StringUtf8Error(#[from] std::string::FromUtf8Error),
-
     #[error("Bincode: {0}")]
     Bincode(#[from] bincode::Error),
-
     #[error("Consumer: {0}")]
     ConsumerError(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
@@ -115,145 +129,242 @@ pub trait BrokerListener: Send + Sync {
     async fn consume(&self, delivery: &Delivery) -> std::result::Result<(), bool>;
 }
 
-/// AMQP Client
-pub struct Broker {
-    conn: Option<Connection>,
-    publisher: Publisher,
-    consumer: Consumer,
+#[async_trait]
+pub trait BrokerManager {
+    async fn declare_publisher(&self, channel: &Channel) -> Result<()>;
+
+    /// Consumer's declaration is not required, some apps only need a publisher, vice & versa
+    async fn declare_consumer(&self, channel: &Channel) -> Result<Option<lapin::Consumer>>;
 }
 
-impl Broker {
-    pub fn new() -> Self {
+/// AMQP Client
+pub struct Broker<M: BrokerManager> {
+    conn: Option<Connection>,
+    /// The publisher will be copied & cloned across the app.
+    /// Messages will be pushed into a queue, and then process to amqp asynchronously.
+    publisher: Publisher,
+    /// A daemon is spawned to process messages queue
+    publisher_queue: PublisherQueue,
+    consumer: Consumer,
+    manager: M,
+    uri: String,
+}
+
+impl<M: BrokerManager> Broker<M> {
+    pub fn new(uri: &str, manager: M) -> Self {
+        let (tx, recv) = unbounded_channel();
+
         Self {
             conn: None,
-            publisher: Publisher::new(),
+            publisher: Publisher::new(tx),
+            publisher_queue: PublisherQueue::new(recv),
             consumer: Consumer::new(),
+            uri: uri.to_owned(),
+            manager,
         }
     }
 
     /// Connect `Broker` to the AMQP endpoint, then declare Proxy's queue.
-    pub async fn init(&mut self, uri: &str) -> Result<()> {
-        let conn = Connection::connect(uri, ConnectionProperties::default().with_tokio()).await?;
+    pub async fn init(&mut self) -> Result<()> {
+        let options = ConnectionProperties::default()
+            // Use tokio executor and reactor.
+            // At the moment the reactor is only available for unix.
+            .with_executor(tokio_executor_trait::Tokio::current())
+            .with_reactor(tokio_reactor_trait::Tokio);
 
-        info!("Broker connected.");
+        let conn = Connection::connect(&self.uri, options).await?;
+
+        // Create Publisher
+        let channel = conn.create_channel().await?;
+        self.manager.declare_publisher(&channel).await?;
+        self.publisher_queue.channel = Some(channel); // not sure whether that is required or not
+
+        // Create Consumer
+        let channel = conn.create_channel().await?;
+        let amqp_consumer = self.manager.declare_consumer(&channel).await?;
+        self.consumer.consumer = amqp_consumer;
+
+        info!("Broker connected, channels created.");
 
         self.conn = Some(conn);
 
         Ok(())
     }
 
-    /// Setup publisher
-    pub async fn setup_publisher(&mut self) -> Result<&Publisher> {
-        let channel = self.conn.as_ref().unwrap().create_channel().await?;
-        self.publisher.channel = Some(channel);
-
-        Ok(&self.publisher)
+    /// Add and store listeners
+    /// When a listener is added, it will bind the queue to the specified exchange name.
+    pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
+        self.consumer.listeners.push(Listener::new(listener));
     }
 
-    /// Init the consumer then return a mut instance in case we need to make more bindings
-    pub async fn setup_consumer(&mut self) -> Result<&mut Consumer> {
-        let channel = self.conn.as_ref().unwrap().create_channel().await?;
-        self.consumer.channel = Some(channel);
-
-        Ok(&mut self.consumer)
-    }
-
-    pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<PublisherConfirm>
+    pub fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<()>
     where
         P: BrokerPublish + Serialize,
     {
-        self.publisher.publish(entity, routing_key).await
+        self.publisher.publish(entity, routing_key)
     }
 
-    pub async fn publish_raw(
-        &self,
-        exchange: &str,
-        routing_key: &str,
-        msg: &[u8],
-    ) -> Result<PublisherConfirm> {
-        self.publisher.publish_raw(exchange, routing_key, msg).await
+    pub fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
+        self.publisher.publish_raw(exchange, routing_key, msg)
+    }
+
+    /// Spawn the consumer and retry on connection interruption
+    pub async fn spawn(&mut self) {
+        loop {
+            if let Err(err) = self.init().await {
+                error!(%err, "amqp connection failed");
+                sleep(RECONNECTION_DELAY).await;
+                continue; // retry connection before hitting the spawn
+            } else {
+                info!("connected to amqp");
+            }
+
+            tokio::select! {
+                err = self.consumer.consume() => {
+                    if let Err(err) = &err {
+                        error!(%err, "amqp consumer failed, trying to reconnect..");
+                    }
+                }
+                err = self.publisher_queue.publish() => {
+                    if let Err(err) = &err {
+                        error!(%err, "amqp publisher failed, trying to reconnect..");
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn publisher(&self) -> &Publisher {
+        &self.publisher
     }
 }
 
+/// needs to be a MPSC queue, in order there's a disconnection, messages still could be added to the queue
+/// but needs to wait to be connected to AMQP in order to process the queue and send the msg on the broker
+/// maybe have a "PublisherQueue"
+#[derive(Clone)]
 pub struct Publisher {
-    channel: Option<Channel>,
+    /// Here we choose Unbounded channel, because if a disconnection happens, a large number of
+    /// messages can be produced while rabbitma has been disconnected.
+    /// Is it a good thing to keep all messages in memory? Unsure yet, the binary memory can grow
+    /// indefinitely if rabbitmq isn't available again. But at least it won't block the async runtime.
+    tx: UnboundedSender<QueueMessage>,
 }
 
 impl Publisher {
-    pub fn new() -> Self {
-        Self { channel: None }
+    fn new(tx: UnboundedSender<QueueMessage>) -> Self {
+        Self { tx }
     }
 
-    pub fn channel(&self) -> &Channel {
-        self.channel.as_ref().expect("Publisher's channel is None")
-    }
-
-    /// Push item into amqp
-    pub async fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<PublisherConfirm>
+    /// Push item into memory queue before pushing it to amqp
+    pub fn publish<P>(&self, entity: &P, routing_key: &str) -> Result<()>
     where
         P: BrokerPublish + Serialize,
     {
         let serialized = bincode::serialize(entity)?;
 
-        // start prometheus duration timer
-        let histogram_timer = STAT_PUBLISHER_DURATION.with_label_values(&[entity.exchange_name(), routing_key]).start_timer();
+        self.tx.send(QueueMessage::new(
+            entity.exchange_name(),
+            routing_key,
+            serialized,
+        ))?;
 
-        let res = self
-            .channel()
-            .basic_publish(
-                entity.exchange_name(),
-                routing_key,
-                BasicPublishOptions::default(),
-                serialized.as_slice(),
-                BasicProperties::default(),
-            )
-            .await;
+        STAT_PUBLISHER_MSG_QUEUE
+            .with_label_values(&[entity.exchange_name(), routing_key])
+            .inc();
 
-        // finish and compute the duration to prometheus
-        histogram_timer.observe_duration();
-
-        res.map_err(|e| Error::Amqp(e))
+        Ok(())
     }
 
-    /// Push without serializing
-    pub async fn publish_raw(
-        &self,
-        exchange: &str,
-        routing_key: &str,
-        msg: &[u8],
-    ) -> Result<PublisherConfirm> {
-        // start prometheus duration timer
-        let histogram_timer = STAT_PUBLISHER_DURATION.with_label_values(&[exchange, routing_key]).start_timer();
+    /// Push without serializing, serializing has been made before calling this function
+    pub fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
+        self.tx
+            .send(QueueMessage::new(exchange, routing_key, msg.to_owned()))?;
 
-        let res = self
-            .channel()
-            .basic_publish(
-                exchange,
-                routing_key,
-                BasicPublishOptions::default(),
-                msg,
-                BasicProperties::default(),
-            )
-            .await;
+        STAT_PUBLISHER_MSG_QUEUE
+            .with_label_values(&[exchange, routing_key])
+            .inc();
 
-        // finish and compute the duration to prometheus
-        histogram_timer.observe_duration();
-
-        // let res = res.await?;
-        res.map_err(|e| Error::Amqp(e))
+        Ok(())
     }
 }
 
-impl Clone for Publisher {
-    fn clone(&self) -> Self {
+pub struct PublisherQueue {
+    recv: UnboundedReceiver<QueueMessage>,
+    channel: Option<Channel>,
+}
+
+impl PublisherQueue {
+    fn new(recv: UnboundedReceiver<QueueMessage>) -> Self {
         Self {
-            channel: self.channel.clone(),
+            recv,
+            channel: None,
+        }
+    }
+
+    /// Process the messages from the queue to AMQP spawn a separate thread to publish
+    /// the message and avoid network delays for new incoming messages
+    ///
+    /// TODO: make sure this doesn't cause any problem such as messaging order issue
+    pub async fn publish(&mut self) -> Result<()> {
+        // process the mpsc queue for new messages
+        while let Some(msg) = self.recv.recv().await {
+            // Clone the Channel to move it to an async thread
+            let channel = self.channel.as_ref().unwrap().clone();
+
+            // send the message on amqp separately
+            tokio::spawn(async move {
+                // start prometheus duration timer
+                let histogram_timer = STAT_PUBLISHER_DURATION
+                    .with_label_values(&[&msg.exchange, &msg.routing_key])
+                    .start_timer();
+
+                let res = channel
+                    .basic_publish(
+                        &msg.exchange,
+                        &msg.routing_key,
+                        BasicPublishOptions::default(),
+                        &msg.content,
+                        BasicProperties::default(),
+                    )
+                    .await;
+
+                // finish and compute the duration to prometheus
+                histogram_timer.observe_duration();
+
+                // decrement the gauge about the number of pending msg in the queue
+                STAT_PUBLISHER_MSG_QUEUE
+                    .with_label_values(&[&msg.exchange, &msg.routing_key])
+                    .dec();
+
+                if let Err(err) = res {
+                    error!(%err, "failed to publish an amqp message");
+                }
+            });
+        }
+
+        Ok(())
+    }
+}
+
+pub struct QueueMessage {
+    exchange: String,
+    routing_key: String,
+    content: Vec<u8>,
+}
+
+impl QueueMessage {
+    fn new(exchange: &str, routing_key: &str, content: Vec<u8>) -> QueueMessage {
+        Self {
+            exchange: exchange.to_owned(),
+            routing_key: routing_key.to_owned(),
+            content,
         }
     }
 }
 
 pub struct Listener {
-    inner: Arc<dyn BrokerListener>,  // Replace Box with Arc, because a Box can not be cloned.
+    inner: Arc<dyn BrokerListener>, // Replace Box with Arc, because a Box can not be cloned.
     semaphore: Arc<Semaphore>,
 }
 
@@ -284,81 +395,54 @@ impl Listener {
 }
 
 pub struct Consumer {
-    channel: Option<Channel>,
     consumer: Option<lapin::Consumer>,
-    listeners: Option<Vec<Listener>>,
+    listeners: Vec<Listener>,
 }
 
 impl Consumer {
     pub fn new() -> Self {
         Self {
-            channel: None,
             consumer: None,
-            listeners: Some(vec![]),
+            listeners: vec![],
         }
-    }
-
-    pub fn channel(&self) -> &Channel {
-        self.channel.as_ref().expect("Consumer's channel is None")
-    }
-
-    pub fn set_consumer(&mut self, consumer: lapin::Consumer) {
-        self.consumer = Some(consumer);
     }
 
     /// Add and store listeners
     /// When a listener is added, it will bind the queue to the specified exchange name.
     pub fn add_listener(&mut self, listener: Arc<dyn BrokerListener>) {
-        self.listeners.as_mut().expect("No listeners found").push(Listener::new(listener));
-    }
-
-    /// Will spawn the Consumer automatically
-    pub fn spawn(&mut self) -> JoinHandle<Result<()>> {
-        let consumer = self
-            .consumer
-            .as_ref()
-            .expect("A consumer hasn't been set.")
-            .clone();
-        let listeners = self.listeners.take().expect("No listeners found");
-
-        let handle = task::spawn(Consumer::consume(consumer, listeners));
-
-        info!("Consumer has been launched in background.");
-
-        handle
-    }
-
-    /// In order to spawn it manually.
-    pub fn get_consumer(&mut self) -> (lapin::Consumer, Vec<Listener>) {
-        let consumer = self
-            .consumer
-            .as_ref()
-            .expect("A consumer hasn't been set.")
-            .clone();
-        let listeners = self.listeners.take().expect("No listeners found");
-
-        (consumer, listeners)
+        self.listeners.push(Listener::new(listener));
     }
 
     /// Consume messages by finding the appropriated listener.
-    pub async fn consume(
-        mut consumer: lapin::Consumer,
-        listeners: Vec<Listener>,
-    ) -> Result<()> {
-        debug!("Broker consuming...");
-        while let Some(message) = consumer.next().await {
+    pub async fn consume(&mut self) -> Result<()> {
+        if self.listeners.len() == 0 || self.consumer.is_none() {
+            warn!("No listeners have been found, nothing will be consumed from amqp.");
+
+            loop {
+                // in case there's no listeners, in order to avoid breaking
+                // the job spawn for the publisher, we make an infinite loop here.
+                sleep(Duration::from_secs(60)).await;
+            }
+        } else {
+            info!(listeners = %self.listeners.len(), "Broker consuming...");
+        }
+
+        while let Some(message) = self.consumer.as_mut().unwrap().next().await {
             match message {
                 Ok(delivery) => {
                     // info!("received message: {:?}", delivery);
-                    let listener = listeners
-                        .iter()
-                        .find(|listener| listener.listener().exchange_name() == delivery.exchange.as_str());
+                    let listener = self.listeners.iter().find(|listener| {
+                        listener.listener().exchange_name() == delivery.exchange.as_str()
+                    });
 
                     if let Some(listener) = listener {
                         // Listener found, try to consume the delivery
                         let listener = listener.clone();
                         let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
-                        debug!("waiting for a permit ({}/{} available)", permits_available, permits_max = listener.max_concurrent_tasks());
+                        debug!(
+                            "waiting for a permit ({permits_available}/{permits_max} available)",
+                            permits_max = listener.max_concurrent_tasks()
+                        );
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "max"])
                             .set(listener.max_concurrent_tasks() as i64);
@@ -375,9 +459,7 @@ impl Consumer {
                         task::spawn(consume_async(delivery, listener, permit));
                     } else {
                         // No listener found for that exchange
-                        if let Err(err) = delivery.nack(BasicNackOptions::default())
-                            .await
-                        {
+                        if let Err(err) = delivery.nack(BasicNackOptions::default()).await {
                             panic!("Can't find any registered listeners for `{}` exchange: {:?} + Failed to send nack: {}", &delivery.exchange, &delivery, err);
                         } else {
                             panic!(
@@ -400,7 +482,6 @@ impl Consumer {
 impl Clone for Consumer {
     fn clone(&self) -> Self {
         Self {
-            channel: self.channel.clone(),
             consumer: self.consumer.clone(),
             listeners: self.listeners.clone(),
         }
@@ -413,13 +494,11 @@ impl Clone for Consumer {
 //     channel: Channel,
 // ) {
 /// Consume the delivery async
-async fn consume_async(
-    delivery: Delivery,
-    listener: Listener,
-    permit: OwnedSemaphorePermit,
-) {
+async fn consume_async(delivery: Delivery, listener: Listener, permit: OwnedSemaphorePermit) {
     // start prometheus duration timer
-    let histogram_timer = STAT_CONSUMER_DURATION.with_label_values(&[listener.inner.exchange_name()]).start_timer();
+    let histogram_timer = STAT_CONSUMER_DURATION
+        .with_label_values(&[listener.inner.exchange_name()])
+        .start_timer();
 
     // launch the consumer
     let res = listener.listener().consume(&delivery).await;
@@ -447,7 +526,7 @@ async fn consume_async(
         }
     } else {
         // Consumption went fine, we send ACK
-        if let Err(err) = delivery.ack( BasicAckOptions::default()).await {
+        if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
             error!(
                 %err, "Delivery consumed, but failed to send ACK back to the broker",
             );
