@@ -21,7 +21,6 @@ pub mod types {
 
 use async_trait::async_trait;
 use futures_lite::StreamExt;
-use lapin::publisher_confirm::PublisherConfirm;
 use once_cell::sync::Lazy;
 use prometheus::{opts, register_histogram_vec, register_int_gauge_vec, HistogramVec, IntGaugeVec};
 use serde::Serialize;
@@ -31,9 +30,7 @@ use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::task;
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tokio_amqp::*;
 
 pub type Requeue = bool;
 
@@ -157,8 +154,13 @@ impl<M: BrokerManager> Broker<M> {
 
     /// Connect `Broker` to the AMQP endpoint, then declare Proxy's queue.
     pub async fn init(&mut self) -> Result<()> {
-        let conn =
-            Connection::connect(&self.uri, ConnectionProperties::default().with_tokio()).await?;
+        let options = ConnectionProperties::default()
+            // Use tokio executor and reactor.
+            // At the moment the reactor is only available for unix.
+            .with_executor(tokio_executor_trait::Tokio::current())
+            .with_reactor(tokio_reactor_trait::Tokio);
+
+        let conn = Connection::connect(&self.uri, options).await?;
 
         // Create Publisher
         let channel = conn.create_channel().await?;
@@ -238,7 +240,7 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    pub fn new(tx: UnboundedSender<QueueMessage>) -> Self {
+    fn new(tx: UnboundedSender<QueueMessage>) -> Self {
         Self { tx }
     }
 
@@ -280,44 +282,47 @@ impl PublisherQueue {
         }
     }
 
-    pub async fn send(&self, msg: QueueMessage) -> Result<PublisherConfirm> {
-        // start prometheus duration timer
-        let histogram_timer = STAT_PUBLISHER_DURATION
-            .with_label_values(&[&msg.exchange, &msg.routing_key])
-            .start_timer();
-
-        let res = self
-            .channel
-            .as_ref()
-            .unwrap()
-            .basic_publish(
-                &msg.exchange,
-                &msg.routing_key,
-                BasicPublishOptions::default(),
-                &msg.content,
-                BasicProperties::default(),
-            )
-            .await;
-
-        // finish and compute the duration to prometheus
-        histogram_timer.observe_duration();
-
-        // let res = res.await?;
-        res.map_err(|e| Error::Amqp(e))
-    }
-
-    /// Process the messages from the queue to AMQP
+    /// Process the messages from the queue to AMQP spawn a separate thread to publish
+    /// the message and avoid network delays for new incoming messages
+    ///
+    /// TODO: make sure this doesn't cause any problem such as messaging order issue
     pub async fn publish(&mut self) -> Result<()> {
+        // process the mpsc queue for new messages
         while let Some(msg) = self.recv.recv().await {
-            self.send(msg).await?; // todo: spawn a task here?
-            debug!("message sent to amqp");
+            // Clone the Channel to move it to an async thread
+            let channel = self.channel.as_ref().unwrap().clone();
+
+            // send the message on amqp separately
+            tokio::spawn(async move {
+                // start prometheus duration timer
+                let histogram_timer = STAT_PUBLISHER_DURATION
+                    .with_label_values(&[&msg.exchange, &msg.routing_key])
+                    .start_timer();
+
+                let res = channel
+                    .basic_publish(
+                        &msg.exchange,
+                        &msg.routing_key,
+                        BasicPublishOptions::default(),
+                        &msg.content,
+                        BasicProperties::default(),
+                    )
+                    .await;
+
+                // finish and compute the duration to prometheus
+                histogram_timer.observe_duration();
+
+                if let Err(err) = res {
+                    error!(%err, "failed to publish an amqp message");
+                }
+            });
         }
 
         Ok(())
     }
 }
 
-struct QueueMessage {
+pub struct QueueMessage {
     exchange: String,
     routing_key: String,
     content: Vec<u8>,
@@ -391,7 +396,7 @@ impl Consumer {
             loop {
                 // in case there's no listeners, in order to avoid breaking
                 // the job spawn for the publisher, we make an infinite loop here.
-                sleep(Duration::from_secs(1)).await;
+                sleep(Duration::from_secs(60)).await;
             }
         } else {
             info!(listeners = %self.listeners.len(), "Broker consuming...");
@@ -410,8 +415,7 @@ impl Consumer {
                         let listener = listener.clone();
                         let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
                         debug!(
-                            "waiting for a permit ({}/{} available)",
-                            permits_available,
+                            "waiting for a permit ({permits_available}/{permits_max} available)",
                             permits_max = listener.max_concurrent_tasks()
                         );
                         STAT_CONCURRENT_TASK

@@ -79,7 +79,8 @@ dependencies = [
  "serde",
  "thiserror",
  "tokio",
- "tokio-amqp",
+ "tokio-executor-trait",
+ "tokio-reactor-trait",
  "tracing",
  "uuid",
 ]
@@ -1282,17 +1283,6 @@ dependencies = [
  "socket2",
  "tokio-macros",
  "windows-sys",
-]
-
-[[package]]
-name = "tokio-amqp"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fe356ad388da0ad528624456b6e59f051bf674e0a3eb9d14cf78e35939eb364"
-dependencies = [
- "lapin",
- "tokio-executor-trait",
- "tokio-reactor-trait",
 ]
 
 [[package]]
