@@ -31,9 +31,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::{Receiver, Sender};
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 use tokio::task;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 pub type Requeue = bool;
 
@@ -86,9 +88,12 @@ static STAT_PUBLISHER_MSG_QUEUE: Lazy<GaugeVec> = Lazy::new(|| {
 
 /// The reconnection delay when it detects an amqp disconnection
 const RECONNECTION_DELAY: Duration = Duration::from_millis(1000);
+const AMQP_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("AMQP Client Readiness error: {0}")]
+    ReadinessSignal(String),
     #[error("MpscSendError: {0}")]
     SendError(#[from] SendError<QueueMessage>),
     #[error("acquire-semaphore: {0}")]
@@ -148,11 +153,15 @@ pub struct Broker<M: BrokerManager> {
     consumer: Consumer,
     manager: M,
     uri: String,
+    /// This will synchronize the parent app with amqp being ready to consume.
+    ready_tx: Option<Sender<()>>,
+    ready_rx: Option<Receiver<()>>,
 }
 
 impl<M: BrokerManager> Broker<M> {
     pub fn new(uri: &str, manager: M) -> Self {
         let (tx, recv) = unbounded_channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
 
         Self {
             conn: None,
@@ -161,6 +170,8 @@ impl<M: BrokerManager> Broker<M> {
             consumer: Consumer::new(),
             uri: uri.to_owned(),
             manager,
+            ready_tx: Some(ready_tx),
+            ready_rx: Some(ready_rx),
         }
     }
 
@@ -188,6 +199,12 @@ impl<M: BrokerManager> Broker<M> {
 
         self.conn = Some(conn);
 
+        // send a signal to tell the software that AMQP is ready and listening for incoming messages
+        if let Some(ready_tx) = self.ready_tx.take() {
+            ready_tx.send(()).expect("Can't send the amqp ready signal");
+            debug!("amqp has been initialized and is ready for the first time");
+        }
+
         Ok(())
     }
 
@@ -206,6 +223,18 @@ impl<M: BrokerManager> Broker<M> {
 
     pub fn publish_raw(&self, exchange: &str, routing_key: &str, msg: &[u8]) -> Result<()> {
         self.publisher.publish_raw(exchange, routing_key, msg)
+    }
+
+    /// This will send a copy of the receiver to receive a signal that says the consumer & publisher are ready
+    /// so we could start the software and making sure we've haven't missed any messages.
+    pub fn ready_signal(&mut self) -> Ready {
+        Ready {
+            ready_rx: Some(
+                self.ready_rx
+                    .take()
+                    .expect("amqp::ready_signal() has already been consumed"),
+            ),
+        }
     }
 
     /// Spawn the consumer and retry on connection interruption
@@ -236,6 +265,32 @@ impl<M: BrokerManager> Broker<M> {
 
     pub fn publisher(&self) -> &Publisher {
         &self.publisher
+    }
+}
+
+/// This will send a copy of the receiver to receive a signal that says the consumer & publisher are ready
+/// so we could start the software and making sure we've haven't missed any messages.
+pub struct Ready {
+    ready_rx: Option<Receiver<()>>,
+}
+
+impl Ready {
+    /// This will send a copy of the receiver to receive a signal that says the consumer & publisher are ready
+    /// so we could start the software and making sure we've haven't missed any messages.
+    ///
+    /// A timeout has been added to make sure k8s will restart the containers to avoid
+    /// the container to wait indefinitely the readiness of amqp due to some potential configuration issue.
+    pub async fn wait_to_be_ready(&mut self) -> Result<()> {
+        let secs = AMQP_READINESS_TIMEOUT.as_secs();
+        let fut = self
+            .ready_rx
+            .take()
+            .expect("amqp has already been initialized");
+
+        timeout(AMQP_READINESS_TIMEOUT, fut)
+            .await
+            .map_err(|_| Error::ReadinessSignal(format!("timed out after {secs}s")))?
+            .map_err(|e| Error::ReadinessSignal(e.to_string()))
     }
 }
 
