@@ -23,8 +23,8 @@ use async_trait::async_trait;
 use futures_lite::StreamExt;
 use once_cell::sync::Lazy;
 use prometheus::{
-    opts, register_gauge_vec, register_histogram_vec, register_int_gauge_vec, GaugeVec,
-    HistogramVec, IntGaugeVec,
+    opts, register_gauge_vec, register_histogram_vec, register_int_counter, register_int_gauge_vec,
+    GaugeVec, HistogramVec, IntCounter, IntGaugeVec,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -49,6 +49,14 @@ static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
             "Current/Max concurrent check",
         ),
         &["exchange_name", "kind"],
+    )
+    .unwrap()
+});
+
+static STAT_TIMED_OUT_TASK: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "amqp_consumer_timed_out_tasks",
+        "Count of tasks that hit the emergency timeout",
     )
     .unwrap()
 });
@@ -126,6 +134,18 @@ pub trait BrokerListener: Send + Sync {
     ///  - X: by spawning a task for each of them, up to some concurrent limit X (use semaphore internally)
     fn max_concurrent_tasks(&self) -> usize {
         1
+    }
+
+    /// The emergency termination timeout for the `consume` method
+    /// (Prefer having shorter fine-grained timeouts on inner operations, but this is the last resort against
+    ///  tasks hanging forever and starving the queue. 5 minutes by default)
+    fn task_timeout(&self) -> Duration {
+        Duration::from_millis(1000 * 60 * 5)
+    }
+
+    /// Whether to requeue upon an emergency termination timeout
+    fn requeue_on_timeout(&self) -> bool {
+        false
     }
 
     /// The method that will be called in the struct impl on every messages received
@@ -556,7 +576,11 @@ async fn consume_async(delivery: Delivery, listener: Listener, permit: OwnedSema
         .start_timer();
 
     // launch the consumer
-    let res = listener.listener().consume(&delivery).await;
+    let res = timeout(
+        listener.listener().task_timeout(),
+        listener.listener().consume(&delivery),
+    )
+    .await;
     drop(permit); // release the permit immediately
 
     STAT_CONCURRENT_TASK
@@ -565,6 +589,15 @@ async fn consume_async(delivery: Delivery, listener: Listener, permit: OwnedSema
 
     // finish and compute the duration to prometheus
     histogram_timer.observe_duration();
+
+    let res = match res {
+        Ok(inner) => inner,
+        Err(_) => {
+            error!("Consume task timed out");
+            STAT_TIMED_OUT_TASK.inc();
+            Err(listener.listener().requeue_on_timeout())
+        }
+    };
 
     if let Err(requeue) = res {
         let mut options = BasicRejectOptions::default();
