@@ -2,7 +2,7 @@
 name = "amqp-lapin-helper"
 description = "rust lapin helper"
 license = "MIT"
-version = "0.7.0"
+version = "0.7.1"
 authors = ["Jonathan Dizdarevic <dizzda@gmail.com>"]
 edition = "2021"
 repository = "https://github.com/dizda/amqp-lapin-helper"
