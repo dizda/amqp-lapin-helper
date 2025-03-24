@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "amqp-lapin-helper"
-version = "0.7.1"
+version = "0.7.3"
 dependencies = [
  "async-trait",
  "bincode",
