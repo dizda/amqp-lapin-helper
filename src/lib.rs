@@ -21,6 +21,7 @@ pub mod types {
 
 use async_trait::async_trait;
 use futures_lite::StreamExt;
+pub use leaky_bucket::RateLimiter;
 use prometheus::{
     opts, register_gauge_vec, register_histogram_vec, register_int_counter, register_int_gauge_vec,
     GaugeVec, HistogramVec, IntCounter, IntGaugeVec,
@@ -46,6 +47,17 @@ static STAT_CONCURRENT_TASK: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         opts!(
             "amqp_consumer_concurrent_tasks",
             "Current/Max concurrent check",
+        ),
+        &["exchange_name", "kind"],
+    )
+    .unwrap()
+});
+
+static STAT_RATE_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        opts!(
+            "amqp_consumer_rate_limit_tokens",
+            "Current/Max rate limiting tokens count",
         ),
         &["exchange_name", "kind"],
     )
@@ -129,10 +141,20 @@ pub trait BrokerListener: Send + Sync {
     /// Bind the queue & struct to this exchange name
     fn exchange_name(&self) -> &'static str;
 
-    /// How to process the Messages queue
-    ///  - X: by spawning a task for each of them, up to some concurrent limit X (use semaphore internally)
+    /// The concurrency limit for the listener (will not run more than this number of running tasks).
+    /// (Note: if your tasks are doing I/O with timeouts, waiting on timeouts counts as running,
+    ///  and so a few of timeouts happening at the same time can really impact the consumption rate,
+    ///  so prefer rate limiting for those scenarios instead of relying on concurrency limiting,
+    ///  setting this limit way high.)
     fn max_concurrent_tasks(&self) -> usize {
         1
+    }
+
+    /// The rate limit for the listener, based on the leaky bucket algorithm
+    /// (unlike the concurrency limit, new permits are also refilled each time interval,
+    ///  not when a task completes, so e.g. time-sensitive work would not get delayed by timeouts).
+    fn task_rate_limit(&self) -> Option<RateLimiter> {
+        None
     }
 
     /// The emergency termination timeout for the `consume` method
@@ -441,12 +463,14 @@ impl QueueMessage {
 pub struct Listener {
     inner: Arc<dyn BrokerListener>, // Replace Box with Arc, because a Box can not be cloned.
     semaphore: Arc<Semaphore>,
+    rate_limit: Option<Arc<RateLimiter>>,
 }
 
 impl Listener {
     pub fn new(listener: Arc<dyn BrokerListener>) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(listener.max_concurrent_tasks())),
+            rate_limit: listener.task_rate_limit().map(Arc::new),
             inner: listener,
         }
     }
@@ -502,10 +526,11 @@ impl Consumer {
                     if let Some(listener) = listener {
                         // Listener found, try to consume the delivery
                         let listener = listener.clone();
-                        let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
+
                         debug!(
-                            "waiting for a permit ({permits_available}/{permits_max} available)",
-                            permits_max = listener.max_concurrent_tasks()
+                            permits_available = listener.semaphore.available_permits(),
+                            permits_max = listener.max_concurrent_tasks(),
+                            "waiting for a semaphore permit"
                         );
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "max"])
@@ -513,11 +538,29 @@ impl Consumer {
 
                         let permit = listener.semaphore.clone();
                         let permit = permit.acquire_owned().await?;
-                        debug!("Got a permit, we can start to check");
+                        debug!("got a semaphore permit");
 
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
                             .inc();
+
+                        if let Some(rate_limit) = listener.rate_limit.as_ref() {
+                            STAT_RATE_LIMIT
+                                .with_label_values(&[delivery.exchange.as_str(), "max"])
+                                .set(rate_limit.max() as i64);
+                            debug!(
+                                balance = rate_limit.balance(),
+                                max = rate_limit.max(),
+                                "waiting for a rate limiter permit",
+                            );
+
+                            rate_limit.acquire_one().await;
+                            debug!("got a rate limiter permit");
+
+                            STAT_RATE_LIMIT
+                                .with_label_values(&[delivery.exchange.as_str(), "balance"])
+                                .set(rate_limit.balance() as i64);
+                        }
 
                         // consume the delivery asynchronously
                         task::spawn(consume_async(delivery, listener, permit));
