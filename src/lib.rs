@@ -1,4 +1,4 @@
-#[forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 #[macro_use]
 extern crate tracing;
 
@@ -469,6 +469,7 @@ impl Listener {
     }
 }
 
+#[derive(Default)]
 pub struct Consumer {
     consumer: Option<lapin::Consumer>,
     listeners: Vec<Listener>,
@@ -476,10 +477,7 @@ pub struct Consumer {
 
 impl Consumer {
     pub fn new() -> Self {
-        Self {
-            consumer: None,
-            listeners: vec![],
-        }
+        Default::default()
     }
 
     /// Add and store listeners
@@ -490,7 +488,7 @@ impl Consumer {
 
     /// Consume messages by finding the appropriated listener.
     pub async fn consume(&mut self) -> Result<()> {
-        if self.listeners.len() == 0 || self.consumer.is_none() {
+        if self.listeners.is_empty() || self.consumer.is_none() {
             warn!("No listeners have been found, nothing will be consumed from amqp.");
 
             loop {
@@ -600,8 +598,11 @@ async fn consume_async(delivery: Delivery, listener: Listener, permit: OwnedSema
     };
 
     if let Err(requeue) = res {
-        let mut options = BasicRejectOptions::default();
-        options.requeue = requeue;
+        #[allow(clippy::needless_update)]
+        let options = BasicRejectOptions {
+            requeue,
+            ..Default::default()
+        };
 
         if let Err(err_reject) = delivery.reject(options).await {
             error!(requeue, %err_reject, "Broker failed to send REJECT");
