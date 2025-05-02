@@ -62,7 +62,7 @@ static STAT_TIMED_OUT_TASK: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 const EXPONENTIAL_SECONDS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0,
 ];
 
 static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
