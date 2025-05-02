@@ -21,13 +21,12 @@ pub mod types {
 
 use async_trait::async_trait;
 use futures_lite::StreamExt;
-use once_cell::sync::Lazy;
 use prometheus::{
     opts, register_gauge_vec, register_histogram_vec, register_int_counter, register_int_gauge_vec,
     GaugeVec, HistogramVec, IntCounter, IntGaugeVec,
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -42,7 +41,7 @@ pub type Requeue = bool;
 pub type Result<E> = std::result::Result<E, Error>;
 pub type ConsumeResult<E> = std::result::Result<E, Requeue>;
 
-static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
+static STAT_CONCURRENT_TASK: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         opts!(
             "amqp_consumer_concurrent_tasks",
@@ -53,7 +52,7 @@ static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static STAT_TIMED_OUT_TASK: Lazy<IntCounter> = Lazy::new(|| {
+static STAT_TIMED_OUT_TASK: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "amqp_consumer_timed_out_tasks",
         "Count of tasks that hit the emergency timeout",
@@ -65,7 +64,7 @@ const EXPONENTIAL_SECONDS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0,
 ];
 
-static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+static STAT_CONSUMER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "amqp_consumer_duration",
         "The duration of the consumer",
@@ -75,7 +74,7 @@ static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+static STAT_PUBLISHER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "amqp_publisher_duration",
         "The duration of the publisher",
@@ -85,7 +84,7 @@ static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static STAT_PUBLISHER_MSG_QUEUE: Lazy<GaugeVec> = Lazy::new(|| {
+static STAT_PUBLISHER_MSG_QUEUE: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "amqp_publisher_msg_queue",
         "The number of messages pending in the queue",

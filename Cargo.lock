@@ -85,7 +85,6 @@ dependencies = [
  "chrono",
  "futures-lite 1.13.0",
  "lapin",
- "once_cell",
  "prometheus",
  "serde",
  "thiserror 1.0.69",
