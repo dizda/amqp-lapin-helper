@@ -437,18 +437,10 @@ impl QueueMessage {
     }
 }
 
+#[derive(Clone)]
 pub struct Listener {
     inner: Arc<dyn BrokerListener>, // Replace Box with Arc, because a Box can not be cloned.
     semaphore: Arc<Semaphore>,
-}
-
-impl Clone for Listener {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            semaphore: self.semaphore.clone(),
-        }
-    }
 }
 
 impl Listener {
@@ -468,7 +460,7 @@ impl Listener {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Consumer {
     consumer: Option<lapin::Consumer>,
     listeners: Vec<Listener>,
@@ -548,15 +540,6 @@ impl Consumer {
             }
         }
         Ok(())
-    }
-}
-
-impl Clone for Consumer {
-    fn clone(&self) -> Self {
-        Self {
-            consumer: self.consumer.clone(),
-            listeners: self.listeners.clone(),
-        }
     }
 }
 
