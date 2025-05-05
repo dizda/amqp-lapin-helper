@@ -1,4 +1,4 @@
-#[forbid(unsafe_code)]
+#![forbid(unsafe_code)]
 #[macro_use]
 extern crate tracing;
 
@@ -21,13 +21,13 @@ pub mod types {
 
 use async_trait::async_trait;
 use futures_lite::StreamExt;
-use once_cell::sync::Lazy;
+pub use leaky_bucket::RateLimiter;
 use prometheus::{
     opts, register_gauge_vec, register_histogram_vec, register_int_counter, register_int_gauge_vec,
     GaugeVec, HistogramVec, IntCounter, IntGaugeVec,
 };
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -42,7 +42,7 @@ pub type Requeue = bool;
 pub type Result<E> = std::result::Result<E, Error>;
 pub type ConsumeResult<E> = std::result::Result<E, Requeue>;
 
-static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
+static STAT_CONCURRENT_TASK: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         opts!(
             "amqp_consumer_concurrent_tasks",
@@ -53,7 +53,18 @@ static STAT_CONCURRENT_TASK: Lazy<IntGaugeVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static STAT_TIMED_OUT_TASK: Lazy<IntCounter> = Lazy::new(|| {
+static STAT_RATE_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        opts!(
+            "amqp_consumer_rate_limit_tokens",
+            "Current/Max rate limiting tokens count",
+        ),
+        &["exchange_name", "kind"],
+    )
+    .unwrap()
+});
+
+static STAT_TIMED_OUT_TASK: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "amqp_consumer_timed_out_tasks",
         "Count of tasks that hit the emergency timeout",
@@ -62,10 +73,10 @@ static STAT_TIMED_OUT_TASK: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 const EXPONENTIAL_SECONDS: &[f64] = &[
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0,
 ];
 
-static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+static STAT_CONSUMER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "amqp_consumer_duration",
         "The duration of the consumer",
@@ -75,7 +86,7 @@ static STAT_CONSUMER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+static STAT_PUBLISHER_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
     register_histogram_vec!(
         "amqp_publisher_duration",
         "The duration of the publisher",
@@ -85,7 +96,7 @@ static STAT_PUBLISHER_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap()
 });
 
-static STAT_PUBLISHER_MSG_QUEUE: Lazy<GaugeVec> = Lazy::new(|| {
+static STAT_PUBLISHER_MSG_QUEUE: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "amqp_publisher_msg_queue",
         "The number of messages pending in the queue",
@@ -130,10 +141,20 @@ pub trait BrokerListener: Send + Sync {
     /// Bind the queue & struct to this exchange name
     fn exchange_name(&self) -> &'static str;
 
-    /// How to process the Messages queue
-    ///  - X: by spawning a task for each of them, up to some concurrent limit X (use semaphore internally)
+    /// The concurrency limit for the listener (will not run more than this number of running tasks).
+    /// (Note: if your tasks are doing I/O with timeouts, waiting on timeouts counts as running,
+    ///  and so a few of timeouts happening at the same time can really impact the consumption rate,
+    ///  so prefer rate limiting for those scenarios instead of relying on concurrency limiting,
+    ///  setting this limit way high.)
     fn max_concurrent_tasks(&self) -> usize {
         1
+    }
+
+    /// The rate limit for the listener, based on the leaky bucket algorithm
+    /// (unlike the concurrency limit, new permits are also refilled each time interval,
+    ///  not when a task completes, so e.g. time-sensitive work would not get delayed by timeouts).
+    fn task_rate_limit(&self) -> Option<RateLimiter> {
+        None
     }
 
     /// The emergency termination timeout for the `consume` method
@@ -438,24 +459,18 @@ impl QueueMessage {
     }
 }
 
+#[derive(Clone)]
 pub struct Listener {
     inner: Arc<dyn BrokerListener>, // Replace Box with Arc, because a Box can not be cloned.
     semaphore: Arc<Semaphore>,
-}
-
-impl Clone for Listener {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            semaphore: self.semaphore.clone(),
-        }
-    }
+    rate_limit: Option<Arc<RateLimiter>>,
 }
 
 impl Listener {
     pub fn new(listener: Arc<dyn BrokerListener>) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(listener.max_concurrent_tasks())),
+            rate_limit: listener.task_rate_limit().map(Arc::new),
             inner: listener,
         }
     }
@@ -469,6 +484,7 @@ impl Listener {
     }
 }
 
+#[derive(Default, Clone)]
 pub struct Consumer {
     consumer: Option<lapin::Consumer>,
     listeners: Vec<Listener>,
@@ -476,10 +492,7 @@ pub struct Consumer {
 
 impl Consumer {
     pub fn new() -> Self {
-        Self {
-            consumer: None,
-            listeners: vec![],
-        }
+        Default::default()
     }
 
     /// Add and store listeners
@@ -490,7 +503,7 @@ impl Consumer {
 
     /// Consume messages by finding the appropriated listener.
     pub async fn consume(&mut self) -> Result<()> {
-        if self.listeners.len() == 0 || self.consumer.is_none() {
+        if self.listeners.is_empty() || self.consumer.is_none() {
             warn!("No listeners have been found, nothing will be consumed from amqp.");
 
             loop {
@@ -513,10 +526,11 @@ impl Consumer {
                     if let Some(listener) = listener {
                         // Listener found, try to consume the delivery
                         let listener = listener.clone();
-                        let permits_available = listener.semaphore.available_permits() as i64; // i64 for prometheus
+
                         debug!(
-                            "waiting for a permit ({permits_available}/{permits_max} available)",
-                            permits_max = listener.max_concurrent_tasks()
+                            permits_available = listener.semaphore.available_permits(),
+                            permits_max = listener.max_concurrent_tasks(),
+                            "waiting for a semaphore permit"
                         );
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "max"])
@@ -524,11 +538,29 @@ impl Consumer {
 
                         let permit = listener.semaphore.clone();
                         let permit = permit.acquire_owned().await?;
-                        debug!("Got a permit, we can start to check");
+                        debug!("got a semaphore permit");
 
                         STAT_CONCURRENT_TASK
                             .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
                             .inc();
+
+                        if let Some(rate_limit) = listener.rate_limit.as_ref() {
+                            STAT_RATE_LIMIT
+                                .with_label_values(&[delivery.exchange.as_str(), "max"])
+                                .set(rate_limit.max() as i64);
+                            debug!(
+                                balance = rate_limit.balance(),
+                                max = rate_limit.max(),
+                                "waiting for a rate limiter permit",
+                            );
+
+                            rate_limit.acquire_one().await;
+                            debug!("got a rate limiter permit");
+
+                            STAT_RATE_LIMIT
+                                .with_label_values(&[delivery.exchange.as_str(), "balance"])
+                                .set(rate_limit.balance() as i64);
+                        }
 
                         // consume the delivery asynchronously
                         task::spawn(consume_async(delivery, listener, permit));
@@ -551,15 +583,6 @@ impl Consumer {
             }
         }
         Ok(())
-    }
-}
-
-impl Clone for Consumer {
-    fn clone(&self) -> Self {
-        Self {
-            consumer: self.consumer.clone(),
-            listeners: self.listeners.clone(),
-        }
     }
 }
 
@@ -600,8 +623,11 @@ async fn consume_async(delivery: Delivery, listener: Listener, permit: OwnedSema
     };
 
     if let Err(requeue) = res {
-        let mut options = BasicRejectOptions::default();
-        options.requeue = requeue;
+        #[allow(clippy::needless_update)]
+        let options = BasicRejectOptions {
+            requeue,
+            ..Default::default()
+        };
 
         if let Err(err_reject) = delivery.reject(options).await {
             error!(requeue, %err_reject, "Broker failed to send REJECT");
