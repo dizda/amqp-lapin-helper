@@ -531,25 +531,8 @@ impl Consumer {
                     if let Some(listener) = listener {
                         let listener = listener.clone();
 
-                        if let Some(rate_limit) = listener.rate_limit.as_ref() {
-                            STAT_RATE_LIMIT
-                                .with_label_values(&[delivery.exchange.as_str(), "max"])
-                                .set(rate_limit.max() as i64);
-                            debug!(
-                                balance = rate_limit.balance(),
-                                max = rate_limit.max(),
-                                "waiting for a rate limiter permit",
-                            );
-
-                            rate_limit.acquire_one().await;
-                            debug!("got a rate limiter permit");
-
-                            STAT_RATE_LIMIT
-                                .with_label_values(&[delivery.exchange.as_str(), "balance"])
-                                .set(rate_limit.balance() as i64);
-                        }
-
                         if let Some(ref semaphore) = listener.semaphore {
+                            // Concurrent path: semaphore first, then rate_limit
                             debug!(
                                 permits_available = semaphore.available_permits(),
                                 permits_max = listener.max_concurrent_tasks(),
@@ -566,8 +549,45 @@ impl Consumer {
                                 .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
                                 .inc();
 
+                            if let Some(rate_limit) = listener.rate_limit.as_ref() {
+                                STAT_RATE_LIMIT
+                                    .with_label_values(&[delivery.exchange.as_str(), "max"])
+                                    .set(rate_limit.max() as i64);
+                                debug!(
+                                    balance = rate_limit.balance(),
+                                    max = rate_limit.max(),
+                                    "waiting for a rate limiter permit",
+                                );
+
+                                rate_limit.acquire_one().await;
+                                debug!("got a rate limiter permit");
+
+                                STAT_RATE_LIMIT
+                                    .with_label_values(&[delivery.exchange.as_str(), "balance"])
+                                    .set(rate_limit.balance() as i64);
+                            }
+
                             task::spawn(consume_async(delivery, listener, permit));
                         } else {
+                            // Inline path: rate_limit only (no semaphore)
+                            if let Some(rate_limit) = listener.rate_limit.as_ref() {
+                                STAT_RATE_LIMIT
+                                    .with_label_values(&[delivery.exchange.as_str(), "max"])
+                                    .set(rate_limit.max() as i64);
+                                debug!(
+                                    balance = rate_limit.balance(),
+                                    max = rate_limit.max(),
+                                    "waiting for a rate limiter permit",
+                                );
+
+                                rate_limit.acquire_one().await;
+                                debug!("got a rate limiter permit");
+
+                                STAT_RATE_LIMIT
+                                    .with_label_values(&[delivery.exchange.as_str(), "balance"])
+                                    .set(rate_limit.balance() as i64);
+                            }
+
                             consume_inline(delivery, listener).await;
                         }
                     } else {
