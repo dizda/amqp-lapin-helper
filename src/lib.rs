@@ -562,8 +562,11 @@ impl Consumer {
                                 .set(rate_limit.balance() as i64);
                         }
 
-                        // consume the delivery asynchronously
-                        task::spawn(consume_async(delivery, listener, permit));
+                        if listener.max_concurrent_tasks() == 1 {
+                            consume_async(delivery, listener, permit).await;
+                        } else {
+                            task::spawn(consume_async(delivery, listener, permit));
+                        }
                     } else {
                         // No listener found for that exchange
                         if let Err(err) = delivery.nack(BasicNackOptions::default()).await {
