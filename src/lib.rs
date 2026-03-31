@@ -461,15 +461,20 @@ impl QueueMessage {
 
 #[derive(Clone)]
 pub struct Listener {
-    inner: Arc<dyn BrokerListener>, // Replace Box with Arc, because a Box can not be cloned.
-    semaphore: Arc<Semaphore>,
+    inner: Arc<dyn BrokerListener>,
+    semaphore: Option<Arc<Semaphore>>,
     rate_limit: Option<Arc<RateLimiter>>,
 }
 
 impl Listener {
     pub fn new(listener: Arc<dyn BrokerListener>) -> Self {
+        let max = listener.max_concurrent_tasks();
         Self {
-            semaphore: Arc::new(Semaphore::new(listener.max_concurrent_tasks())),
+            semaphore: if max > 1 {
+                Some(Arc::new(Semaphore::new(max)))
+            } else {
+                None
+            },
             rate_limit: listener.task_rate_limit().map(Arc::new),
             inner: listener,
         }
@@ -524,25 +529,7 @@ impl Consumer {
                     });
 
                     if let Some(listener) = listener {
-                        // Listener found, try to consume the delivery
                         let listener = listener.clone();
-
-                        debug!(
-                            permits_available = listener.semaphore.available_permits(),
-                            permits_max = listener.max_concurrent_tasks(),
-                            "waiting for a semaphore permit"
-                        );
-                        STAT_CONCURRENT_TASK
-                            .with_label_values(&[delivery.exchange.as_str(), "max"])
-                            .set(listener.max_concurrent_tasks() as i64);
-
-                        let permit = listener.semaphore.clone();
-                        let permit = permit.acquire_owned().await?;
-                        debug!("got a semaphore permit");
-
-                        STAT_CONCURRENT_TASK
-                            .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
-                            .inc();
 
                         if let Some(rate_limit) = listener.rate_limit.as_ref() {
                             STAT_RATE_LIMIT
@@ -562,10 +549,26 @@ impl Consumer {
                                 .set(rate_limit.balance() as i64);
                         }
 
-                        if listener.max_concurrent_tasks() == 1 {
-                            consume_async(delivery, listener, permit).await;
-                        } else {
+                        if let Some(ref semaphore) = listener.semaphore {
+                            debug!(
+                                permits_available = semaphore.available_permits(),
+                                permits_max = listener.max_concurrent_tasks(),
+                                "waiting for a semaphore permit"
+                            );
+                            STAT_CONCURRENT_TASK
+                                .with_label_values(&[delivery.exchange.as_str(), "max"])
+                                .set(listener.max_concurrent_tasks() as i64);
+
+                            let permit = semaphore.clone().acquire_owned().await?;
+                            debug!("got a semaphore permit");
+
+                            STAT_CONCURRENT_TASK
+                                .with_label_values(&[delivery.exchange.as_str(), "permits_used"])
+                                .inc();
+
                             task::spawn(consume_async(delivery, listener, permit));
+                        } else {
+                            consume_inline(delivery, listener).await;
                         }
                     } else {
                         // No listener found for that exchange
@@ -643,6 +646,54 @@ async fn consume_async(delivery: Delivery, listener: Listener, permit: OwnedSema
         }
     } else {
         // Consumption went fine, we send ACK
+        if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
+            error!(
+                %err, "Delivery consumed, but failed to send ACK back to the broker",
+            );
+        }
+    }
+}
+
+/// Inline variant of consume_async for single-task listeners (no semaphore).
+async fn consume_inline(delivery: Delivery, listener: Listener) {
+    let histogram_timer = STAT_CONSUMER_DURATION
+        .with_label_values(&[listener.inner.exchange_name()])
+        .start_timer();
+
+    let res = timeout(
+        listener.listener().task_timeout(),
+        listener.listener().consume(&delivery),
+    )
+    .await;
+
+    histogram_timer.observe_duration();
+
+    let res = match res {
+        Ok(inner) => inner,
+        Err(_) => {
+            error!("Consume task timed out");
+            STAT_TIMED_OUT_TASK.inc();
+            Err(listener.listener().requeue_on_timeout())
+        }
+    };
+
+    if let Err(requeue) = res {
+        #[allow(clippy::needless_update)]
+        let options = BasicRejectOptions {
+            requeue,
+            ..Default::default()
+        };
+
+        if let Err(err_reject) = delivery.reject(options).await {
+            error!(requeue, %err_reject, "Broker failed to send REJECT");
+        } else {
+            let exchange_name = listener.inner.exchange_name();
+            let routing_key = delivery.routing_key;
+            let redelivered = delivery.redelivered;
+
+            warn!(requeue, %exchange_name, %routing_key, %redelivered, "Error during consumption of a delivery, `REJECT` sent");
+        }
+    } else {
         if let Err(err) = delivery.ack(BasicAckOptions::default()).await {
             error!(
                 %err, "Delivery consumed, but failed to send ACK back to the broker",
