@@ -94,6 +94,26 @@ cargo run --example consumer -- --help
 
 By default the examples expose metrics on **127.0.0.1:3765** (producer) and **127.0.0.1:2765** (consumer).
 
+## Testing your listeners
+
+`BrokerListener::consume` takes a `Delivery`, which lapin only hands out from a live connection — so unit-testing a listener normally means either a running broker or restructuring the listener so the interesting logic sits in a separate function.
+
+`test_util` builds one directly:
+
+```rust
+use amqp_lapin_helper::test_util;
+
+let result = my_listener
+    .consume(&test_util::delivery("my_exchange", r#"{"action":"add"}"#))
+    .await;
+
+assert_eq!(result, Ok(()));
+```
+
+Use `test_util::delivery_with` when the listener branches on the routing key, delivery tag or redelivered flag.
+
+The delivery's acker is non-functional, which is fine because `consume` never acks — the `Broker` does that after `consume` returns, mapping `Err(requeue)` to a reject. Test-only; don't build deliveries this way in production code.
+
 ## API documentation
 
 ```sh

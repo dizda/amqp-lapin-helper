@@ -19,6 +19,87 @@ pub mod types {
     pub use lapin::types::*;
 }
 
+/// Helpers for unit-testing a [`BrokerListener`] implementation.
+///
+/// [`BrokerListener::consume`] takes a [`Delivery`], which lapin only ever hands out
+/// from a live connection. These constructors let a downstream crate exercise its
+/// `consume` logic against a plain payload — no broker, no `#[ignore]`d integration
+/// test, and no direct `lapin` dependency just to name the private-ish types a
+/// `Delivery` is made of.
+///
+/// The returned delivery's acker is non-functional: `ack`/`nack`/`reject` on it will
+/// not reach a channel. That's fine for testing `consume`, which never acks — the
+/// [`Broker`] does that, after `consume` returns. Don't use these outside tests.
+///
+/// ```
+/// use amqp_lapin_helper::{test_util, BrokerListener, ConsumeResult};
+/// use amqp_lapin_helper::message::Delivery;
+///
+/// struct Utf8Only;
+///
+/// #[async_trait::async_trait]
+/// impl BrokerListener for Utf8Only {
+///     fn exchange_name(&self) -> &'static str {
+///         "my_exchange"
+///     }
+///
+///     async fn consume(&self, delivery: &Delivery) -> ConsumeResult<()> {
+///         // reject anything that isn't valid UTF-8, without requeueing
+///         std::str::from_utf8(&delivery.data).map(|_| ()).map_err(|_| false)
+///     }
+/// }
+///
+/// let listener = Utf8Only;
+///
+/// futures_lite::future::block_on(async {
+///     assert_eq!(
+///         listener.consume(&test_util::delivery("my_exchange", "hello")).await,
+///         Ok(())
+///     );
+///     assert_eq!(
+///         listener.consume(&test_util::delivery("my_exchange", vec![0xff])).await,
+///         Err(false)
+///     );
+/// });
+/// ```
+pub mod test_util {
+    use lapin::{acker::Acker, message::Delivery, types::ShortString, BasicProperties};
+
+    /// A [`Delivery`] carrying `payload`, as if it had arrived on `exchange` with an
+    /// empty routing key.
+    ///
+    /// See [`delivery_with`] when the listener under test branches on the routing key,
+    /// delivery tag or redelivered flag.
+    pub fn delivery(exchange: &str, payload: impl Into<Vec<u8>>) -> Delivery {
+        delivery_with(exchange, "", payload, 1, false)
+    }
+
+    /// [`delivery`] with every field spelled out.
+    pub fn delivery_with(
+        exchange: &str,
+        routing_key: &str,
+        payload: impl Into<Vec<u8>>,
+        delivery_tag: u64,
+        redelivered: bool,
+    ) -> Delivery {
+        Delivery {
+            delivery_tag,
+            exchange: ShortString::from(exchange),
+            routing_key: ShortString::from(routing_key),
+            redelivered,
+            properties: BasicProperties::default(),
+            data: payload.into(),
+            // The only way to build an `Acker` from outside lapin. It is deprecated
+            // (lapin logs a warning and plans removal in 3.0) precisely because it is
+            // unusable for acking — which is exactly what we want here, and why this
+            // lives in the library: one place to fix when lapin 3.0 lands, instead of
+            // one per downstream test module.
+            #[allow(deprecated)]
+            acker: Acker::default(),
+        }
+    }
+}
+
 use async_trait::async_trait;
 use futures_lite::StreamExt;
 pub use leaky_bucket::RateLimiter;
